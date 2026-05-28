@@ -32,7 +32,9 @@ func (f *fakeModel) Stream(_ context.Context, _ []*schema.Message, _ ...model.Op
 	return sr, nil
 }
 
-func (f *fakeModel) WithTools(_ []*schema.ToolInfo) (model.ToolCallingChatModel, error) { return f, nil }
+func (f *fakeModel) WithTools(_ []*schema.ToolInfo) (model.ToolCallingChatModel, error) {
+	return f, nil
+}
 
 func TestStreamTurnEmitsReasoningThenText(t *testing.T) {
 	var buf bytes.Buffer
@@ -71,5 +73,48 @@ func TestStreamTurnEmitsReasoningThenText(t *testing.T) {
 	}
 	if msg.Content != "Hello world" {
 		t.Errorf("merged content = %q, want %q", msg.Content, "Hello world")
+	}
+}
+
+// TestStreamTurnClosesTextBeforeInterleavedReasoning guards the symmetric block
+// close: if a provider emits reasoning AFTER text has started, the open TEXT block
+// must close before the REASONING block opens, so the two never overlap on the
+// wire. Latent today (the live provider sends reasoning-before-text) but activates
+// silently on a provider change.
+func TestStreamTurnClosesTextBeforeInterleavedReasoning(t *testing.T) {
+	var buf bytes.Buffer
+	w := bufio.NewWriter(&buf)
+	emit := NewEmitter(context.Background(), w, sse.NewSSEWriter(), "t", "r", nil)
+
+	fm := &fakeModel{chunks: []*schema.Message{
+		{Role: schema.Assistant, Content: "first"},
+		{Role: schema.Assistant, ReasoningContent: "rethink"},
+		{Role: schema.Assistant, Content: "second"},
+	}}
+
+	if _, err := streamTurn(context.Background(), emit, fm, nil); err != nil {
+		t.Fatalf("streamTurn: %v", err)
+	}
+	_ = w.Flush()
+	out := buf.String()
+
+	// The first TEXT block must close before the interleaved REASONING opens.
+	firstTextEnd := strings.Index(out, `"type":"TEXT_MESSAGE_END"`)
+	reasoningStart := strings.Index(out, `"type":"REASONING_START"`)
+	if firstTextEnd == -1 || reasoningStart == -1 {
+		t.Fatalf("expected both a TEXT_MESSAGE_END and a REASONING_START:\n%s", out)
+	}
+	if firstTextEnd > reasoningStart {
+		t.Errorf("the TEXT block must close before the interleaved REASONING opens:\n%s", out)
+	}
+
+	// And REASONING must close before the second TEXT block opens.
+	reasoningEnd := strings.Index(out, `"type":"REASONING_END"`)
+	secondTextStart := strings.LastIndex(out, `"type":"TEXT_MESSAGE_START"`)
+	if reasoningEnd == -1 || secondTextStart == -1 {
+		t.Fatalf("expected a REASONING_END and a second TEXT_MESSAGE_START:\n%s", out)
+	}
+	if reasoningEnd > secondTextStart {
+		t.Errorf("REASONING must close before the second TEXT block opens:\n%s", out)
 	}
 }

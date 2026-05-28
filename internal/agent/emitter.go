@@ -3,6 +3,7 @@ package agent
 import (
 	"bufio"
 	"context"
+	"strings"
 
 	"github.com/ag-ui-protocol/ag-ui/sdks/community/go/pkg/core/events"
 	"github.com/ag-ui-protocol/ag-ui/sdks/community/go/pkg/core/types"
@@ -24,7 +25,8 @@ type Emitter struct {
 	threadID string
 	runID    string
 	cancel   context.CancelFunc
-	err      error
+	err      error // first transport (disconnect) error; once set, all writes are no-ops
+	encErr   error // first encoding/validation error; the event was dropped but the stream stays live
 }
 
 // NewEmitter builds an Emitter bound to a request's SSE writer. cancel may be
@@ -33,19 +35,44 @@ func NewEmitter(ctx context.Context, w *bufio.Writer, sw *sse.SSEWriter, threadI
 	return &Emitter{ctx: ctx, w: w, sse: sw, threadID: threadID, runID: runID, cancel: cancel}
 }
 
-// Err returns the first write error, if any.
+// Err returns the first transport (client-disconnect) error, if any.
 func (e *Emitter) Err() error { return e.err }
+
+// EncErr returns the first encoding/validation error, if any. Unlike Err it does
+// not gate subsequent writes: a malformed event is dropped (and logged by the SDK)
+// but the stream stays alive so the run can still reach a terminal event.
+func (e *Emitter) EncErr() error { return e.encErr }
 
 func (e *Emitter) write(ev events.Event) {
 	if e.err != nil {
 		return
 	}
 	if err := e.sse.WriteEvent(e.ctx, e.w, ev); err != nil {
-		e.err = err
-		if e.cancel != nil {
-			e.cancel() // abort the in-flight model stream on client disconnect
+		if isTransportError(err) {
+			// The client is gone. Stop emitting and cancel the run context so an
+			// in-flight model stream aborts promptly.
+			e.err = err
+			if e.cancel != nil {
+				e.cancel()
+			}
+			return
+		}
+		// An encoding/validation failure is a content bug, not a disconnect. Record
+		// it for visibility and drop just this event; keep the stream open so a
+		// terminal RUN_ERROR/RUN_FINISHED can still be written.
+		if e.encErr == nil {
+			e.encErr = err
 		}
 	}
+}
+
+// isTransportError reports whether a WriteEvent error came from the socket write or
+// flush (client gone) rather than event encoding/frame creation (a content bug).
+// The SDK does not export typed errors, so this matches its wrapper prefixes
+// (pkg/encoding/sse/writer.go); keep it in sync if those strings change.
+func isTransportError(err error) bool {
+	msg := err.Error()
+	return strings.Contains(msg, "SSE write failed") || strings.Contains(msg, "SSE flush failed")
 }
 
 // --- run lifecycle ---

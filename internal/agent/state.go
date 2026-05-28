@@ -1,6 +1,8 @@
 package agent
 
 import (
+	"encoding/json"
+
 	"github.com/ag-ui-protocol/ag-ui/sdks/community/go/pkg/core/events"
 )
 
@@ -55,7 +57,9 @@ func (s *State) Seed(v any) {
 
 // Snapshot returns the full state as a plain map for STATE_SNAPSHOT / persistence.
 // FilesRead is copied so the returned map (which may be stored in runstore) does
-// not alias the live backing slice.
+// not alias the live backing slice. extra values are copied shallowly — fine today
+// because nothing mutates a seeded value after Seed; if extra ever becomes mutable,
+// deep-copy here to avoid aliasing the snapshot held by the SSE encoder and runstore.
 func (s *State) Snapshot() map[string]any {
 	m := map[string]any{}
 	for k, v := range s.extra {
@@ -70,7 +74,8 @@ func (s *State) Snapshot() map[string]any {
 }
 
 // RecordFileRead mutates state for a completed file read and returns the JSON
-// Patch describing the change (for a STATE_DELTA event).
+// Patch describing the change (for a STATE_DELTA event). filesRead is an append-log,
+// not a set: the same path read twice appears twice (mirroring the toolCalls count).
 func (s *State) RecordFileRead(path string) []events.JSONPatchOperation {
 	s.ToolCalls++
 	s.FilesRead = append(s.FilesRead, path)
@@ -88,10 +93,16 @@ func (s *State) SetStatus(status string) []events.JSONPatchOperation {
 	return []events.JSONPatchOperation{{Op: "replace", Path: "/status", Value: status}}
 }
 
+// toStringSlice and toInt are intentionally lenient: a client that seeds a reserved
+// key (status/filesRead/toolCalls) with the wrong JSON type gets a zero value rather
+// than an error, since the agent owns those keys and overwrites them anyway.
 func toStringSlice(v any) []string {
 	switch t := v.(type) {
 	case []string:
-		return t
+		// Copy so a caller-owned slice can't be mutated by a later RecordFileRead append.
+		out := make([]string, len(t))
+		copy(out, t)
+		return out
 	case []any:
 		out := make([]string, 0, len(t))
 		for _, e := range t {
@@ -110,6 +121,10 @@ func toInt(v any) int {
 		return t
 	case float64:
 		return int(t)
+	case json.Number:
+		if n, err := t.Int64(); err == nil {
+			return int(n)
+		}
 	}
 	return 0
 }

@@ -6,6 +6,14 @@ import (
 	"strconv"
 )
 
+const (
+	// DefaultMaxIterations bounds the model<->tool loop per run when unset/invalid.
+	DefaultMaxIterations = 8
+	// MaxIterationsCeiling caps AGENT_MAX_ITERATIONS so an accidental large value
+	// can't run the (paid) model an unbounded number of times.
+	MaxIterationsCeiling = 64
+)
+
 // Config holds the server's runtime configuration.
 type Config struct {
 	Host string
@@ -43,15 +51,19 @@ func Load() Config {
 			model = "gpt-5.5" // codex CLI default
 		}
 	}
+	port := envInt("PORT", 8080)
+	if port < 1 || port > 65535 {
+		port = 8080 // out-of-range value would otherwise fail late at Listen with an opaque error
+	}
 	return Config{
 		Host:          envOr("HOST", "127.0.0.1"),
-		Port:          envInt("PORT", 8080),
+		Port:          port,
 		Provider:      provider,
 		Model:         model,
 		CodexAppName:  envOr("CODEX_APP_NAME", "ag-ui-go-server-example"),
 		Workspace:     envOr("AGENT_WORKSPACE", wd),
 		AutoApprove:   envBool("AGENT_AUTO_APPROVE", false),
-		MaxIterations: envInt("AGENT_MAX_ITERATIONS", 8),
+		MaxIterations: envInt("AGENT_MAX_ITERATIONS", DefaultMaxIterations),
 		CORS:          envBool("CORS_ENABLED", true),
 	}
 }

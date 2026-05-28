@@ -1,6 +1,8 @@
 package agent
 
 import (
+	"strings"
+
 	aguievents "github.com/ag-ui-protocol/ag-ui/sdks/community/go/pkg/core/events"
 	aguitypes "github.com/ag-ui-protocol/ag-ui/sdks/community/go/pkg/core/types"
 	"github.com/cloudwego/eino/schema"
@@ -11,32 +13,55 @@ import (
 func toEinoMessages(in []aguitypes.Message) []*schema.Message {
 	out := make([]*schema.Message, 0, len(in))
 	for _, m := range in {
-		content, ok := m.ContentString()
 		switch m.Role {
 		case aguitypes.RoleUser:
-			// ContentString returns ok=false for multimodal/structured content
-			// ([]InputContent). Skip rather than inject an empty user turn — a
-			// blank message would silently drop the user's actual input.
-			if !ok {
-				continue
+			if text := messageText(m); text != "" {
+				out = append(out, schema.UserMessage(text))
 			}
-			out = append(out, schema.UserMessage(content))
 		case aguitypes.RoleSystem, aguitypes.RoleDeveloper:
-			if !ok {
-				continue
+			if text := messageText(m); text != "" {
+				out = append(out, schema.SystemMessage(text))
 			}
-			out = append(out, schema.SystemMessage(content))
 		case aguitypes.RoleAssistant:
+			content, _ := m.ContentString()
 			out = append(out, &schema.Message{
 				Role:      schema.Assistant,
 				Content:   content,
 				ToolCalls: toEinoToolCalls(m.ToolCalls),
 			})
 		case aguitypes.RoleTool:
+			content, _ := m.ContentString()
 			out = append(out, schema.ToolMessage(content, m.ToolCallID))
 		}
 	}
 	return out
+}
+
+// messageText returns the message's text. ContentString applies to plain string
+// content; for multimodal/structured content ([]InputContent) it returns ok=false,
+// in which case we join the text fragments. Non-text fragments (image/audio/binary)
+// are dropped — this agent has no vision/audio path — but the user's typed text is
+// preserved instead of the whole turn being silently discarded. An empty result
+// means the turn has no usable text; the caller skips it rather than inject a blank
+// turn that would erase the user's actual input.
+func messageText(m aguitypes.Message) string {
+	if s, ok := m.ContentString(); ok {
+		return s
+	}
+	parts, ok := m.ContentInputContents()
+	if !ok {
+		return ""
+	}
+	var b strings.Builder
+	for _, p := range parts {
+		if p.Type == aguitypes.InputContentTypeText && p.Text != "" {
+			if b.Len() > 0 {
+				b.WriteByte('\n')
+			}
+			b.WriteString(p.Text)
+		}
+	}
+	return b.String()
 }
 
 func toEinoToolCalls(tcs []aguitypes.ToolCall) []schema.ToolCall {

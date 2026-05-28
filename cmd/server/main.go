@@ -11,7 +11,10 @@ import (
 	"log/slog"
 	"net"
 	"os"
+	"os/signal"
 	"strconv"
+	"syscall"
+	"time"
 
 	aguievents "github.com/ag-ui-protocol/ag-ui/sdks/community/go/pkg/core/events"
 	aguitypes "github.com/ag-ui-protocol/ag-ui/sdks/community/go/pkg/core/types"
@@ -29,6 +32,17 @@ func main() {
 	logger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelInfo}))
 	cfg := config.Load()
 	ctx := context.Background()
+
+	if cfg.MaxIterations <= 0 {
+		logger.Warn("AGENT_MAX_ITERATIONS is <= 0; using the default per-run iteration budget",
+			"configured", cfg.MaxIterations, "default", config.DefaultMaxIterations)
+	}
+
+	if os.Getenv("AGENT_WORKSPACE") == "" {
+		logger.Warn("AGENT_WORKSPACE is unset; the read-only file_read tool is rooted at the "+
+			"process working directory — set it deliberately to bound what the agent can read",
+			"workspace", cfg.Workspace)
+	}
 
 	base, err := agent.NewModel(ctx, cfg)
 	if err != nil {
@@ -83,18 +97,29 @@ func main() {
 		})
 	})
 
-	app.Post("/agentic", agenticHandler(deps, logger))
+	// Graceful shutdown: on SIGINT/SIGTERM, Fiber stops accepting connections and
+	// lets in-flight SSE runs drain (up to ShutdownTimeout) instead of being killed.
+	// sigCtx is also threaded into the agentic handler so a shutdown cancels the run
+	// context of in-flight requests, aborting their model streams promptly instead of
+	// leaking them (and billing the provider) until the drain deadline.
+	sigCtx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+
+	app.Post("/agentic", agenticHandler(sigCtx, deps, logger))
 
 	addr := net.JoinHostPort(cfg.Host, strconv.Itoa(cfg.Port))
 	logger.Info("starting server", "addr", addr, "provider", cfg.Provider, "model", cfg.Model,
 		"workspace", cfg.Workspace, "autoApprove", cfg.AutoApprove)
-	if err := app.Listen(addr); err != nil {
+	if err := app.Listen(addr, fiber.ListenConfig{
+		GracefulContext: sigCtx,
+		ShutdownTimeout: 10 * time.Second,
+	}); err != nil {
 		logger.Error("server stopped", "error", err)
 		os.Exit(1)
 	}
 }
 
-func agenticHandler(deps *agent.Deps, logger *slog.Logger) fiber.Handler {
+func agenticHandler(shutdownCtx context.Context, deps *agent.Deps, logger *slog.Logger) fiber.Handler {
 	sw := sse.NewSSEWriter().WithLogger(logger)
 	return func(c fiber.Ctx) error {
 		var in aguitypes.RunAgentInput
@@ -114,17 +139,30 @@ func agenticHandler(deps *agent.Deps, logger *slog.Logger) fiber.Handler {
 		c.Set("Content-Type", "text/event-stream")
 		c.Set("Cache-Control", "no-cache")
 		c.Set("Connection", "keep-alive")
-		c.Set("Access-Control-Allow-Origin", "*")
+		// CORS headers are owned by the cors middleware (gated by CORS_ENABLED), so
+		// it stays the single source of truth. Setting Access-Control-Allow-Origin
+		// here would duplicate it and force "*" even when CORS is disabled.
 
 		return c.SendStreamWriter(func(w *bufio.Writer) {
-			// Derive the run context from Background, not the fasthttp RequestCtx:
-			// the stream writer runs after the handler returns (RequestCtx is then
-			// recycled) and RequestCtx never signals client disconnect. The emitter
-			// cancels this context on the first failed write, aborting the model
-			// stream when the client goes away.
-			runCtx, cancel := context.WithCancel(context.Background())
+			// Derive the run context from the shutdown context, not the fasthttp
+			// RequestCtx: the stream writer runs after the handler returns (RequestCtx
+			// is then recycled) and RequestCtx never signals client disconnect.
+			// Parenting on shutdownCtx means a SIGINT/SIGTERM also cancels in-flight
+			// runs, aborting the model stream instead of leaking it until the drain
+			// deadline. The emitter additionally cancels this context on the first
+			// failed write, aborting the stream when the client goes away.
+			runCtx, cancel := context.WithCancel(shutdownCtx)
 			defer cancel()
 			emit := agent.NewEmitter(runCtx, w, sw, threadID, runID, cancel)
+			// A panic inside the agent loop (provider bug, nil deref) would otherwise
+			// unwind through the stream-writer goroutine and truncate the stream with
+			// no terminal event. Turn it into a RUN_ERROR instead.
+			defer func() {
+				if r := recover(); r != nil {
+					logger.Error("agent panicked", "thread", threadID, "run", runID, "panic", r)
+					emit.RunError("the agent crashed while handling this run")
+				}
+			}()
 			agent.Run(runCtx, emit, &in, deps, threadID, runID)
 			if err := emit.Err(); err != nil {
 				logger.Warn("event stream ended early", "thread", threadID, "run", runID, "error", err)

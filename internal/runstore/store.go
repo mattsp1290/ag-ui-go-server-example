@@ -79,7 +79,21 @@ func (s *Store) Save(key string, saved *Saved) {
 	if _, exists := s.m[key]; !exists && len(s.m) >= s.maxEntries {
 		s.evictOldestLocked()
 	}
-	s.m[key] = &entry{saved: saved, at: now}
+	// Copy the caller's slices and State map so the store owns its data and a
+	// later mutation of the caller's Messages/Pending/State can't reach the saved
+	// run. (The *schema.Message pointees are still shared by reference; the only
+	// caller builds a fresh messages slice per turn and never mutates a message in
+	// place, so a deep clone of the pointees would be wasted work.)
+	state := make(map[string]any, len(saved.State))
+	for k, v := range saved.State {
+		state[k] = v
+	}
+	stored := &Saved{
+		Messages: append([]*schema.Message(nil), saved.Messages...),
+		Pending:  append([]schema.ToolCall(nil), saved.Pending...),
+		State:    state,
+	}
+	s.m[key] = &entry{saved: stored, at: now}
 }
 
 // Load returns a paused run and whether it was present. An entry past its TTL is
@@ -104,6 +118,26 @@ func (s *Store) Delete(key string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	delete(s.m, key)
+}
+
+// LoadAndDelete atomically returns a paused run and removes it from the store, so
+// exactly one caller can claim a given paused run. An entry past its TTL is treated
+// as a miss (and is still removed). This is the resume primitive: a plain
+// Load-then-Delete is a TOCTOU race that lets two concurrent resumes of the same
+// thread/run both observe the entry and both execute its pending tool calls.
+func (s *Store) LoadAndDelete(key string) (*Saved, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	e, ok := s.m[key]
+	if !ok {
+		return nil, false
+	}
+	delete(s.m, key)
+	if s.now().Sub(e.at) >= s.ttl {
+		return nil, false
+	}
+	return e.saved, true
 }
 
 func (s *Store) purgeExpiredLocked(now time.Time) {
