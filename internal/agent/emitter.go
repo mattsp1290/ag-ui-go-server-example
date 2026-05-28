@@ -12,18 +12,25 @@ import (
 // Emitter serializes AG-UI events to an SSE stream. It records the first write
 // error and becomes a no-op afterward, so loop code can stay terse and check
 // Err() at convenient points (a write error means the client disconnected).
+//
+// On the first write failure it invokes cancel (if set), which cancels the run
+// context so an in-flight model stream aborts promptly instead of generating
+// against a gone client. This is how client disconnect is detected: fasthttp's
+// RequestCtx does not signal disconnect, only a failed SSE write does.
 type Emitter struct {
 	ctx      context.Context
 	w        *bufio.Writer
 	sse      *sse.SSEWriter
 	threadID string
 	runID    string
+	cancel   context.CancelFunc
 	err      error
 }
 
-// NewEmitter builds an Emitter bound to a request's SSE writer.
-func NewEmitter(ctx context.Context, w *bufio.Writer, sw *sse.SSEWriter, threadID, runID string) *Emitter {
-	return &Emitter{ctx: ctx, w: w, sse: sw, threadID: threadID, runID: runID}
+// NewEmitter builds an Emitter bound to a request's SSE writer. cancel may be
+// nil; when non-nil it is called once, on the first write error.
+func NewEmitter(ctx context.Context, w *bufio.Writer, sw *sse.SSEWriter, threadID, runID string, cancel context.CancelFunc) *Emitter {
+	return &Emitter{ctx: ctx, w: w, sse: sw, threadID: threadID, runID: runID, cancel: cancel}
 }
 
 // Err returns the first write error, if any.
@@ -35,6 +42,9 @@ func (e *Emitter) write(ev events.Event) {
 	}
 	if err := e.sse.WriteEvent(e.ctx, e.w, ev); err != nil {
 		e.err = err
+		if e.cancel != nil {
+			e.cancel() // abort the in-flight model stream on client disconnect
+		}
 	}
 }
 

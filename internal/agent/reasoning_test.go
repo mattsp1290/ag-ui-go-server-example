@@ -37,7 +37,7 @@ func (f *fakeModel) WithTools(_ []*schema.ToolInfo) (model.ToolCallingChatModel,
 func TestStreamTurnEmitsReasoningThenText(t *testing.T) {
 	var buf bytes.Buffer
 	w := bufio.NewWriter(&buf)
-	emit := NewEmitter(context.Background(), w, sse.NewSSEWriter(), "t", "r")
+	emit := NewEmitter(context.Background(), w, sse.NewSSEWriter(), "t", "r", nil)
 
 	fm := &fakeModel{chunks: []*schema.Message{
 		{Role: schema.Assistant, ReasoningContent: "let me think"},

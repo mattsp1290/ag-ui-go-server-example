@@ -16,7 +16,7 @@ import (
 	"github.com/mattsp1290/ag-ui-go-server-example/internal/runstore"
 )
 
-const maxIterations = 8
+const defaultMaxIterations = 8
 
 // defaultSystemPrompt is used when the request carries no system/developer
 // message. The Codex Responses API requires non-empty instructions, and it also
@@ -38,11 +38,12 @@ func ensureSystemPrompt(messages []*schema.Message) []*schema.Message {
 
 // Deps are the shared dependencies for running an agent turn.
 type Deps struct {
-	Model       model.ToolCallingChatModel // already tool-bound
-	Tools       *Toolset
-	Store       *runstore.Store
-	AutoApprove bool
-	Logger      *slog.Logger
+	Model         model.ToolCallingChatModel // already tool-bound
+	Tools         *Toolset
+	Store         *runstore.Store
+	AutoApprove   bool
+	MaxIterations int // <= 0 falls back to defaultMaxIterations
+	Logger        *slog.Logger
 }
 
 // Run executes one AG-UI run: it streams the full event surface for either a
@@ -58,17 +59,29 @@ func Run(ctx context.Context, emit *Emitter, in *aguitypes.RunAgentInput, deps *
 
 	// Resume path: rehydrate a paused run and settle the pending tool calls.
 	if len(in.Resume) > 0 {
-		if saved, ok := deps.Store.Load(key); ok {
-			deps.Store.Delete(key)
-			st = StateFromSnapshot(saved.State)
-			messages = saved.Messages
-			emit.StateSnapshot(st.Snapshot())
-
-			approvals := approvalsFromResume(in.Resume)
-			emit.StepStarted("tools")
-			settlePendingToolCalls(ctx, emit, deps, saved.Pending, &messages, st, approvals)
-			emit.StepFinished("tools")
+		saved, ok := deps.Store.Load(key)
+		if !ok {
+			emit.RunError("cannot resume: no paused run found for this thread/run " +
+				"(it may have expired, already been resumed, or the server restarted)")
+			return
 		}
+		deps.Store.Delete(key)
+		st = StateFromSnapshot(saved.State)
+		messages = saved.Messages
+		emit.StateSnapshot(st.Snapshot())
+
+		approvals := approvalsFromResume(in.Resume)
+		// Every pending tool call needs an explicit decision; otherwise the
+		// zero-value map lookup would silently deny an un-addressed call.
+		for _, tc := range saved.Pending {
+			if _, decided := approvals[tc.ID]; !decided {
+				emit.RunError(fmt.Sprintf("resume did not address pending tool call %q", tc.ID))
+				return
+			}
+		}
+		emit.StepStarted("tools")
+		settlePendingToolCalls(ctx, emit, deps, saved.Pending, &messages, st, approvals)
+		emit.StepFinished("tools")
 	}
 
 	// Fresh path.
@@ -79,7 +92,13 @@ func Run(ctx context.Context, emit *Emitter, in *aguitypes.RunAgentInput, deps *
 		emit.StateSnapshot(st.Snapshot())
 	}
 
-	for iter := 0; iter < maxIterations; iter++ {
+	maxIter := deps.MaxIterations
+	if maxIter <= 0 {
+		maxIter = defaultMaxIterations
+	}
+
+	converged := false
+	for iter := 0; iter < maxIter; iter++ {
 		if emit.Err() != nil || ctx.Err() != nil {
 			return // client disconnected
 		}
@@ -88,12 +107,14 @@ func Run(ctx context.Context, emit *Emitter, in *aguitypes.RunAgentInput, deps *
 		assistant, err := streamTurn(ctx, emit, deps.Model, messages)
 		emit.StepFinished("llm")
 		if err != nil {
-			emit.RunError(fmt.Sprintf("model turn failed: %v", err))
+			deps.Logger.Error("model turn failed", "thread", threadID, "run", runID, "error", err)
+			emit.RunError("the agent failed to generate a response")
 			return
 		}
 		messages = append(messages, assistant)
 
 		if len(assistant.ToolCalls) == 0 {
+			converged = true
 			break // final answer
 		}
 
@@ -137,6 +158,16 @@ func Run(ctx context.Context, emit *Emitter, in *aguitypes.RunAgentInput, deps *
 		emit.StepFinished("tools")
 	}
 
+	if !converged {
+		// Hit the iteration cap with tool calls still pending — the model never
+		// produced a final answer, so this is an error, not a successful run.
+		deps.Logger.Warn("agent did not converge within iteration budget",
+			"thread", threadID, "run", runID, "maxIterations", maxIter)
+		emit.MessagesSnapshot(toAGUIMessages(messages))
+		emit.RunError(fmt.Sprintf("agent did not converge within %d iterations", maxIter))
+		return
+	}
+
 	emit.StateDelta(st.SetStatus("done"))
 	emit.Custom("agent_complete", map[string]any{"toolCalls": st.ToolCalls, "filesRead": st.FilesRead})
 	emit.MessagesSnapshot(toAGUIMessages(messages))
@@ -165,6 +196,17 @@ func streamTurn(ctx context.Context, emit *Emitter, cm model.ToolCallingChatMode
 			reasoningOpen = false
 		}
 	}
+	// closeOpenBlocks balances any started message block. Deferred so that an
+	// early return on a mid-stream Recv error still closes the open TEXT/REASONING
+	// block on the wire, rather than leaving a client hanging on an open message.
+	closeOpenBlocks := func() {
+		closeReasoning()
+		if textOpen {
+			emit.TextEnd(textID)
+			textOpen = false
+		}
+	}
+	defer closeOpenBlocks()
 
 	for {
 		chunk, recvErr := sr.Recv()
@@ -172,7 +214,7 @@ func streamTurn(ctx context.Context, emit *Emitter, cm model.ToolCallingChatMode
 			break
 		}
 		if recvErr != nil {
-			return nil, recvErr
+			return nil, recvErr // deferred closeOpenBlocks balances the stream
 		}
 		if chunk.ReasoningContent != "" {
 			if !reasoningOpen {
@@ -191,10 +233,6 @@ func streamTurn(ctx context.Context, emit *Emitter, cm model.ToolCallingChatMode
 			emit.TextContent(textID, chunk.Content)
 		}
 		chunks = append(chunks, chunk)
-	}
-	closeReasoning()
-	if textOpen {
-		emit.TextEnd(textID)
 	}
 	if len(chunks) == 0 {
 		return nil, fmt.Errorf("empty model stream")
@@ -222,10 +260,13 @@ func settlePendingToolCalls(ctx context.Context, emit *Emitter, deps *Deps, call
 				map[string]any{"text": fmt.Sprintf("Running %s(%s)", tc.Function.Name, tc.Function.Arguments)})
 			out, err := deps.Tools.Run(ctx, tc.Function.Name, tc.Function.Arguments)
 			if err != nil {
+				// A failed read must not be recorded as a file successfully read.
 				out = fmt.Sprintf(`{"error":%q}`, err.Error())
+				emit.StateDelta(st.SetStatus("read_error"))
+			} else {
+				emit.StateDelta(st.RecordFileRead(extractPath(tc.Function.Arguments)))
 			}
 			result = out
-			emit.StateDelta(st.RecordFileRead(extractPath(tc.Function.Arguments)))
 		} else {
 			result = `{"denied":true,"reason":"user did not approve this tool call"}`
 		}
@@ -252,6 +293,9 @@ func approvalsFromResume(entries []aguitypes.ResumeEntry) map[string]bool {
 	return approvals
 }
 
+// extractPath pulls the path out of file_read arguments for a human-readable
+// state/activity label only. It is best-effort: malformed args or a missing path
+// both yield "(unknown)". The tool itself validates the real arguments.
 func extractPath(argsJSON string) string {
 	var a struct {
 		Path string `json:"path"`

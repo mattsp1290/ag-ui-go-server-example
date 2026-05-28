@@ -20,9 +20,13 @@ type Config struct {
 	CodexAppName string
 
 	// Workspace is the absolute directory the read-only file_read tool is rooted at.
+	// Defaults to the process working directory (override with AGENT_WORKSPACE);
+	// since this is the root the agent can read, set it deliberately in real use.
 	Workspace string
 	// AutoApprove bypasses the human-in-the-loop tool-approval interrupt when true.
 	AutoApprove bool
+	// MaxIterations bounds the model<->tool loop per run (env AGENT_MAX_ITERATIONS).
+	MaxIterations int
 	// CORS enables permissive CORS for local UI development.
 	CORS bool
 }
@@ -40,14 +44,15 @@ func Load() Config {
 		}
 	}
 	return Config{
-		Host:         envOr("HOST", "127.0.0.1"),
-		Port:         envInt("PORT", 8080),
-		Provider:     provider,
-		Model:        model,
-		CodexAppName: envOr("CODEX_APP_NAME", "ag-ui-go-server-example"),
-		Workspace:    envOr("AGENT_WORKSPACE", wd),
-		AutoApprove:  envBool("AGENT_AUTO_APPROVE", false),
-		CORS:         envBool("CORS_ENABLED", true),
+		Host:          envOr("HOST", "127.0.0.1"),
+		Port:          envInt("PORT", 8080),
+		Provider:      provider,
+		Model:         model,
+		CodexAppName:  envOr("CODEX_APP_NAME", "ag-ui-go-server-example"),
+		Workspace:     envOr("AGENT_WORKSPACE", wd),
+		AutoApprove:   envBool("AGENT_AUTO_APPROVE", false),
+		MaxIterations: envInt("AGENT_MAX_ITERATIONS", 8),
+		CORS:          envBool("CORS_ENABLED", true),
 	}
 }
 

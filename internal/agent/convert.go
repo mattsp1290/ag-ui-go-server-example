@@ -11,11 +11,20 @@ import (
 func toEinoMessages(in []aguitypes.Message) []*schema.Message {
 	out := make([]*schema.Message, 0, len(in))
 	for _, m := range in {
-		content, _ := m.ContentString()
+		content, ok := m.ContentString()
 		switch m.Role {
 		case aguitypes.RoleUser:
+			// ContentString returns ok=false for multimodal/structured content
+			// ([]InputContent). Skip rather than inject an empty user turn — a
+			// blank message would silently drop the user's actual input.
+			if !ok {
+				continue
+			}
 			out = append(out, schema.UserMessage(content))
 		case aguitypes.RoleSystem, aguitypes.RoleDeveloper:
+			if !ok {
+				continue
+			}
 			out = append(out, schema.SystemMessage(content))
 		case aguitypes.RoleAssistant:
 			out = append(out, &schema.Message{

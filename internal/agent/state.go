@@ -19,6 +19,9 @@ func NewState() *State {
 }
 
 // StateFromSnapshot rebuilds a State from a persisted snapshot (used on resume).
+// The keys "status", "filesRead", and "toolCalls" are reserved for the agent
+// lifecycle; client-seeded values under those keys are coerced into the typed
+// fields, not preserved as extra.
 func StateFromSnapshot(m map[string]any) *State {
 	s := NewState()
 	if m == nil {
@@ -51,13 +54,17 @@ func (s *State) Seed(v any) {
 }
 
 // Snapshot returns the full state as a plain map for STATE_SNAPSHOT / persistence.
+// FilesRead is copied so the returned map (which may be stored in runstore) does
+// not alias the live backing slice.
 func (s *State) Snapshot() map[string]any {
 	m := map[string]any{}
 	for k, v := range s.extra {
 		m[k] = v
 	}
+	files := make([]string, len(s.FilesRead))
+	copy(files, s.FilesRead)
 	m["status"] = s.Status
-	m["filesRead"] = s.FilesRead
+	m["filesRead"] = files
 	m["toolCalls"] = s.ToolCalls
 	return m
 }

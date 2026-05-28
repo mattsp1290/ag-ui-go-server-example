@@ -9,7 +9,9 @@ import (
 	"encoding/json"
 	"fmt"
 	"log/slog"
+	"net"
 	"os"
+	"strconv"
 
 	aguievents "github.com/ag-ui-protocol/ag-ui/sdks/community/go/pkg/core/events"
 	aguitypes "github.com/ag-ui-protocol/ag-ui/sdks/community/go/pkg/core/types"
@@ -41,6 +43,11 @@ func main() {
 		os.Exit(1)
 	}
 
+	// boundModel is shared across all concurrent /agentic requests. This is safe
+	// because eino's ToolCallingChatModel.Stream is stateless per call (it takes
+	// the messages as an argument and returns a fresh StreamReader); the codex
+	// provider holds no mutable per-request state. A future provider that caches
+	// per-instance state would need a per-request clone or pool.
 	boundModel, err := base.WithTools(tools.Infos())
 	if err != nil {
 		logger.Error("failed to bind tools", "error", err)
@@ -48,14 +55,15 @@ func main() {
 	}
 
 	deps := &agent.Deps{
-		Model:       boundModel,
-		Tools:       tools,
-		Store:       runstore.New(),
-		AutoApprove: cfg.AutoApprove,
-		Logger:      logger,
+		Model:         boundModel,
+		Tools:         tools,
+		Store:         runstore.New(),
+		AutoApprove:   cfg.AutoApprove,
+		MaxIterations: cfg.MaxIterations,
+		Logger:        logger,
 	}
 
-	app := fiber.New(fiber.Config{AppName: "ag-ui-go-server-example"})
+	app := fiber.New(fiber.Config{AppName: "ag-ui-go-server-example", BodyLimit: 4 * 1024 * 1024})
 	app.Use(requestid.New())
 	if cfg.CORS {
 		app.Use(cors.New(cors.Config{
@@ -77,7 +85,7 @@ func main() {
 
 	app.Post("/agentic", agenticHandler(deps, logger))
 
-	addr := fmt.Sprintf("%s:%d", cfg.Host, cfg.Port)
+	addr := net.JoinHostPort(cfg.Host, strconv.Itoa(cfg.Port))
 	logger.Info("starting server", "addr", addr, "provider", cfg.Provider, "model", cfg.Model,
 		"workspace", cfg.Workspace, "autoApprove", cfg.AutoApprove)
 	if err := app.Listen(addr); err != nil {
@@ -108,10 +116,16 @@ func agenticHandler(deps *agent.Deps, logger *slog.Logger) fiber.Handler {
 		c.Set("Connection", "keep-alive")
 		c.Set("Access-Control-Allow-Origin", "*")
 
-		reqCtx := c.RequestCtx()
 		return c.SendStreamWriter(func(w *bufio.Writer) {
-			emit := agent.NewEmitter(reqCtx, w, sw, threadID, runID)
-			agent.Run(reqCtx, emit, &in, deps, threadID, runID)
+			// Derive the run context from Background, not the fasthttp RequestCtx:
+			// the stream writer runs after the handler returns (RequestCtx is then
+			// recycled) and RequestCtx never signals client disconnect. The emitter
+			// cancels this context on the first failed write, aborting the model
+			// stream when the client goes away.
+			runCtx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			emit := agent.NewEmitter(runCtx, w, sw, threadID, runID, cancel)
+			agent.Run(runCtx, emit, &in, deps, threadID, runID)
 			if err := emit.Err(); err != nil {
 				logger.Warn("event stream ended early", "thread", threadID, "run", runID, "error", err)
 			}

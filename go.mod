@@ -2,6 +2,10 @@ module github.com/mattsp1290/ag-ui-go-server-example
 
 go 1.26.3
 
+// TODO: these replace directives point at local sibling checkouts for the local
+// proof. Before sharing/publishing this module, pin to published versions (or
+// vendor) and remove the absolute-path replaces — the module won't build for
+// anyone without these exact paths.
 replace github.com/ag-ui-protocol/ag-ui/sdks/community/go => /Users/punk1290/git/ag-ui/sdks/community/go
 
 replace github.com/mattsp1290/eino-providers => /Users/punk1290/git/eino-providers
