@@ -73,7 +73,7 @@ func TestMultimodalIntegration(t *testing.T) {
 						Type: aguitypes.InputContentTypeImage,
 						Source: &aguitypes.InputContentSource{
 							Type:     aguitypes.InputContentSourceTypeData,
-							Value:    redPNG1x1(t),
+							Value:    redPNG100x100(t),
 							MimeType: "image/png",
 						},
 					},
@@ -110,15 +110,26 @@ func TestMultimodalIntegration(t *testing.T) {
 	}
 }
 
-// redPNG1x1 generates a 1×1 red PNG and returns its raw base64 encoding.
-// Inline generation avoids any external image-host dependency.
-func redPNG1x1(t *testing.T) string {
+// redPNG100x100 generates a 100×100 red PNG, writes it to /tmp/test-multimodal.png
+// for visual inspection, and returns the raw base64 encoding sent to the model.
+func redPNG100x100(t *testing.T) string {
 	t.Helper()
-	img := image.NewRGBA(image.Rect(0, 0, 1, 1))
-	img.Set(0, 0, color.RGBA{R: 255, G: 0, B: 0, A: 255})
+	img := image.NewRGBA(image.Rect(0, 0, 100, 100))
+	red := color.RGBA{R: 255, G: 0, B: 0, A: 255}
+	for y := range 100 {
+		for x := range 100 {
+			img.Set(x, y, red)
+		}
+	}
 	var buf bytes.Buffer
 	if err := png.Encode(&buf, img); err != nil {
 		t.Fatalf("encode test PNG: %v", err)
+	}
+	const path = "/tmp/test-multimodal.png"
+	if err := os.WriteFile(path, buf.Bytes(), 0o644); err != nil {
+		t.Logf("warning: could not write PNG to %s: %v", path, err)
+	} else {
+		t.Logf("test image written to %s", path)
 	}
 	return base64.StdEncoding.EncodeToString(buf.Bytes())
 }
