@@ -75,6 +75,7 @@ func main() {
 		AutoApprove:   cfg.AutoApprove,
 		MaxIterations: cfg.MaxIterations,
 		Logger:        logger,
+		Provider:      cfg.Provider,
 	}
 
 	app := fiber.New(fiber.Config{AppName: "ag-ui-go-server-example", BodyLimit: 4 * 1024 * 1024})

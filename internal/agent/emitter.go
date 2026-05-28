@@ -165,13 +165,49 @@ func (e *Emitter) StateDelta(ops []events.JSONPatchOperation) {
 }
 
 func (e *Emitter) MessagesSnapshot(msgs []types.Message) {
-	e.write(events.NewMessagesSnapshotEvent(msgs))
+	e.write(events.NewMessagesSnapshotEvent(scrubEncryptedValues(msgs)))
+}
+
+// scrubEncryptedValues returns the slice with EncryptedValue/EncryptedContent
+// zeroed on every message. This prevents encrypted reasoning blobs from leaking
+// to clients via MESSAGES_SNAPSHOT payloads. It is a no-op (returns the original
+// slice unchanged) when no message carries either field, keeping the common path
+// allocation-free.
+func scrubEncryptedValues(msgs []types.Message) []types.Message {
+	needsScrub := false
+	for i := range msgs {
+		if msgs[i].EncryptedValue != "" || msgs[i].EncryptedContent != "" {
+			needsScrub = true
+			break
+		}
+	}
+	if !needsScrub {
+		return msgs
+	}
+	out := make([]types.Message, len(msgs))
+	copy(out, msgs)
+	for i := range out {
+		out[i].EncryptedValue = ""
+		out[i].EncryptedContent = ""
+	}
+	return out
 }
 
 // --- activity / custom ---
 
 func (e *Emitter) ActivitySnapshot(messageID, activityType string, content any) {
 	e.write(events.NewActivitySnapshotEvent(messageID, activityType, content))
+}
+
+func (e *Emitter) ActivityDelta(messageID, activityType string, patch []events.JSONPatchOperation) {
+	if len(patch) == 0 {
+		return
+	}
+	e.write(events.NewActivityDeltaEvent(messageID, activityType, patch))
+}
+
+func (e *Emitter) ReasoningEncryptedValue(subtype events.ReasoningEncryptedValueSubtype, entityID, encryptedValue string) {
+	e.write(events.NewReasoningEncryptedValueEvent(subtype, entityID, encryptedValue))
 }
 
 func (e *Emitter) Custom(name string, value any) {

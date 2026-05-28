@@ -43,6 +43,10 @@ type Deps struct {
 	AutoApprove   bool
 	MaxIterations int // <= 0 falls back to config.DefaultMaxIterations
 	Logger        *slog.Logger
+	// Provider is the model-backend name (e.g. "openai", "openai-codex").
+	// It gates multimodal content forwarding: only "openai" sends image parts
+	// to the model; other backends receive text-only messages.
+	Provider string
 }
 
 // Run executes one AG-UI run: it streams the full event surface for either a
@@ -127,7 +131,7 @@ func Run(ctx context.Context, emit *Emitter, in *aguitypes.RunAgentInput, deps *
 	if st == nil {
 		st = NewState()
 		st.Seed(in.State)
-		messages = ensureSystemPrompt(toEinoMessages(in.Messages))
+		messages = ensureSystemPrompt(toEinoMessages(in.Messages, deps.Provider))
 		emit.StateSnapshot(st.Snapshot())
 	}
 
