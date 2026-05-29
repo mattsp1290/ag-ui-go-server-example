@@ -1,6 +1,7 @@
 package agent
 
 import (
+	"log/slog"
 	"strings"
 
 	aguievents "github.com/ag-ui-protocol/ag-ui/sdks/community/go/pkg/core/events"
@@ -8,14 +9,30 @@ import (
 	"github.com/cloudwego/eino/schema"
 )
 
+// supportsVision reports whether the named provider forwards multimodal
+// (image) content to the model. The openai-codex Responses-API path
+// hard-codes text-only payloads; the plain openai path honours
+// UserInputMultiContent.
+func supportsVision(provider string) bool {
+	return provider == "openai"
+}
+
 // toEinoMessages maps the AG-UI request message history into eino messages.
 // Roles eino has no use for here (reasoning/activity) are skipped.
-func toEinoMessages(in []aguitypes.Message) []*schema.Message {
+// provider is used to gate multimodal forwarding: only the "openai" backend
+// handles UserInputMultiContent; for others, non-text parts are dropped and
+// only text fragments are forwarded.
+func toEinoMessages(in []aguitypes.Message, provider string) []*schema.Message {
+	vision := supportsVision(provider)
 	out := make([]*schema.Message, 0, len(in))
 	for _, m := range in {
 		switch m.Role {
 		case aguitypes.RoleUser:
-			if text := messageText(m); text != "" {
+			if vision {
+				if msg := toEinoUserMessage(m); msg != nil {
+					out = append(out, msg)
+				}
+			} else if text := messageText(m); text != "" {
 				out = append(out, schema.UserMessage(text))
 			}
 		case aguitypes.RoleSystem, aguitypes.RoleDeveloper:
@@ -62,6 +79,91 @@ func messageText(m aguitypes.Message) string {
 		}
 	}
 	return b.String()
+}
+
+// toEinoUserMessage converts a user message to an eino message, preserving
+// image parts for vision-capable providers. Non-image, non-text parts
+// (audio, video, document, binary) are logged and dropped. Returns nil when
+// there is no usable content after filtering.
+func toEinoUserMessage(m aguitypes.Message) *schema.Message {
+	parts, hasParts := m.ContentInputContents()
+	if !hasParts {
+		text, _ := m.ContentString()
+		if text == "" {
+			return nil
+		}
+		return schema.UserMessage(text)
+	}
+
+	var textBuf strings.Builder
+	var multiParts []schema.MessageInputPart
+	hasNonText := false
+
+	for _, p := range parts {
+		switch p.Type {
+		case aguitypes.InputContentTypeText:
+			if p.Text != "" {
+				if textBuf.Len() > 0 {
+					textBuf.WriteByte('\n')
+				}
+				textBuf.WriteString(p.Text)
+				multiParts = append(multiParts, schema.MessageInputPart{
+					Type: schema.ChatMessagePartTypeText,
+					Text: p.Text,
+				})
+			}
+		case aguitypes.InputContentTypeImage:
+			if part, ok := toEinoImagePart(p); ok {
+				multiParts = append(multiParts, part)
+				hasNonText = true
+			}
+		default:
+			slog.Warn("unsupported multimodal content type, dropping", "type", p.Type)
+		}
+	}
+
+	if len(multiParts) == 0 {
+		return nil
+	}
+	if !hasNonText {
+		// All parts were text — use plain Content for cleanliness.
+		return schema.UserMessage(textBuf.String())
+	}
+	return &schema.Message{
+		Role:                  schema.User,
+		UserInputMultiContent: multiParts,
+	}
+}
+
+// toEinoImagePart maps an AG-UI InputContent image fragment to an eino
+// MessageInputPart. It reads Source first (the structured path from
+// UserMessage.multimodal()), then falls back to the flat URL/Data fields.
+func toEinoImagePart(p aguitypes.InputContent) (schema.MessageInputPart, bool) {
+	img := &schema.MessageInputImage{}
+	if p.Source != nil {
+		switch p.Source.Type {
+		case aguitypes.InputContentSourceTypeURL:
+			img.URL = &p.Source.Value
+		case aguitypes.InputContentSourceTypeData:
+			img.Base64Data = &p.Source.Value
+			img.MIMEType = p.Source.MimeType
+		default:
+			slog.Warn("unknown image source type, dropping", "source_type", p.Source.Type)
+			return schema.MessageInputPart{}, false
+		}
+	} else if p.URL != "" {
+		img.URL = &p.URL
+	} else if p.Data != "" {
+		img.Base64Data = &p.Data
+		img.MIMEType = p.MimeType
+	} else {
+		slog.Warn("image part has no source URL or data, dropping")
+		return schema.MessageInputPart{}, false
+	}
+	return schema.MessageInputPart{
+		Type:  schema.ChatMessagePartTypeImageURL,
+		Image: img,
+	}, true
 }
 
 func toEinoToolCalls(tcs []aguitypes.ToolCall) []schema.ToolCall {
