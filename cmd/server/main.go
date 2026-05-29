@@ -25,6 +25,7 @@ import (
 
 	"github.com/mattsp1290/ag-ui-go-server-example/internal/agent"
 	"github.com/mattsp1290/ag-ui-go-server-example/internal/config"
+	"github.com/mattsp1290/ag-ui-go-server-example/internal/imagegen"
 	"github.com/mattsp1290/ag-ui-go-server-example/internal/runstore"
 )
 
@@ -107,6 +108,7 @@ func main() {
 	defer stop()
 
 	app.Post("/agentic", agenticHandler(sigCtx, deps, logger))
+	app.Post("/image-gen", imagegen.Handler(sigCtx, logger))
 
 	addr := net.JoinHostPort(cfg.Host, strconv.Itoa(cfg.Port))
 	logger.Info("starting server", "addr", addr, "provider", cfg.Provider, "model", cfg.Model,
