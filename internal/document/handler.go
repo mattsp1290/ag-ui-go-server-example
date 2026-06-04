@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"log/slog"
+	"strings"
 
 	aguievents "github.com/ag-ui-protocol/ag-ui/sdks/community/go/pkg/core/events"
 	aguitypes "github.com/ag-ui-protocol/ag-ui/sdks/community/go/pkg/core/types"
@@ -14,10 +15,7 @@ import (
 	"github.com/mattsp1290/ag-ui-go-server-example/internal/agent"
 )
 
-const stubMessage = "Document Q&A is coming in a future release."
-
 // Handler returns a Fiber handler for POST /document.
-// This is a stub that validates the Flutter multimodal document input path.
 func Handler(shutdownCtx context.Context, logger *slog.Logger) fiber.Handler {
 	sw := sse.NewSSEWriter().WithLogger(logger)
 	return func(c fiber.Ctx) error {
@@ -53,14 +51,26 @@ func Handler(shutdownCtx context.Context, logger *slog.Logger) fiber.Handler {
 
 			emit.RunStarted()
 
-			if !hasDocumentPart(in.Messages) {
+			pdfBase64, mimeType, prompt, ok := extractDocumentPart(in.Messages)
+			if !ok {
 				emit.RunError("document: no document part found in the last user message")
+				return
+			}
+
+			result, err := Analyze(runCtx, AnalyzeRequest{
+				PDFBase64: pdfBase64,
+				MimeType:  mimeType,
+				Prompt:    prompt,
+			})
+			if err != nil {
+				logger.Error("document analysis failed", "error", err)
+				emit.RunError("document analysis failed: " + err.Error())
 				return
 			}
 
 			msgID := aguievents.GenerateMessageID()
 			emit.TextStart(msgID)
-			emit.TextContent(msgID, stubMessage)
+			emit.TextContent(msgID, result.Text)
 			emit.TextEnd(msgID)
 			emit.MessagesSnapshot([]aguitypes.Message{})
 			emit.RunFinishedSuccess()
@@ -68,9 +78,10 @@ func Handler(shutdownCtx context.Context, logger *slog.Logger) fiber.Handler {
 	}
 }
 
-// hasDocumentPart reports whether the last user message contains a document InputContent
-// with a DataSource. Validates the Flutter path without requiring a real PDF parser.
-func hasDocumentPart(messages []aguitypes.Message) bool {
+// extractDocumentPart scans the last user message for a document InputContent with a
+// DataSource. Also collects any text parts as the prompt. Returns ok=false if no
+// document part is found or source is not inline base64 (URL-source is not supported).
+func extractDocumentPart(messages []aguitypes.Message) (base64Data, mimeType, prompt string, ok bool) {
 	for i := len(messages) - 1; i >= 0; i-- {
 		m := messages[i]
 		if m.Role != aguitypes.RoleUser {
@@ -80,14 +91,29 @@ func hasDocumentPart(messages []aguitypes.Message) bool {
 		if !hasParts {
 			continue
 		}
+		var textBuf strings.Builder
 		for _, p := range parts {
-			if p.Type == aguitypes.InputContentTypeDocument &&
-				p.Source != nil &&
-				p.Source.Type == aguitypes.InputContentSourceTypeData &&
-				p.Source.Value != "" {
-				return true
+			switch p.Type {
+			case aguitypes.InputContentTypeDocument:
+				if p.Source != nil && p.Source.Type == aguitypes.InputContentSourceTypeData && p.Source.Value != "" {
+					base64Data = p.Source.Value
+					mimeType = p.Source.MimeType
+					if mimeType == "" {
+						mimeType = "application/pdf"
+					}
+					ok = true
+				}
+			case aguitypes.InputContentTypeText:
+				if p.Text != "" {
+					if textBuf.Len() > 0 {
+						textBuf.WriteByte('\n')
+					}
+					textBuf.WriteString(p.Text)
+				}
 			}
 		}
+		prompt = textBuf.String()
+		return
 	}
-	return false
+	return
 }

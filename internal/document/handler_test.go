@@ -10,46 +10,74 @@ func makeUserMsg(parts []aguitypes.InputContent) aguitypes.Message {
 	return aguitypes.Message{Role: aguitypes.RoleUser, Content: parts}
 }
 
-func TestHasDocumentPart(t *testing.T) {
-	docPart := func(b64 string) aguitypes.InputContent {
-		return aguitypes.InputContent{
-			Type: aguitypes.InputContentTypeDocument,
-			Source: &aguitypes.InputContentSource{
-				Type:     aguitypes.InputContentSourceTypeData,
-				Value:    b64,
-				MimeType: "application/pdf",
-			},
-		}
+func docPart(b64, mime string) aguitypes.InputContent {
+	return aguitypes.InputContent{
+		Type: aguitypes.InputContentTypeDocument,
+		Source: &aguitypes.InputContentSource{
+			Type:     aguitypes.InputContentSourceTypeData,
+			Value:    b64,
+			MimeType: mime,
+		},
 	}
-	textPart := func(t string) aguitypes.InputContent {
-		return aguitypes.InputContent{Type: aguitypes.InputContentTypeText, Text: t}
-	}
+}
 
+func textPart(text string) aguitypes.InputContent {
+	return aguitypes.InputContent{Type: aguitypes.InputContentTypeText, Text: text}
+}
+
+func TestExtractDocumentPart(t *testing.T) {
 	tests := []struct {
-		name     string
-		messages []aguitypes.Message
-		want     bool
+		name       string
+		messages   []aguitypes.Message
+		wantB64    string
+		wantMime   string
+		wantPrompt string
+		wantOK     bool
 	}{
 		{
-			name: "no messages",
-			want: false,
+			name:   "no messages",
+			wantOK: false,
 		},
 		{
 			name: "text-only message",
 			messages: []aguitypes.Message{
 				makeUserMsg([]aguitypes.InputContent{textPart("hello")}),
 			},
-			want: false,
+			wantOK: false,
 		},
 		{
-			name: "document part found",
+			name: "document part found with question",
 			messages: []aguitypes.Message{
 				makeUserMsg([]aguitypes.InputContent{
-					docPart("JVBERi0xLjQK"),
-					textPart("What is this?"),
+					docPart("JVBERi0xLjQK", "application/pdf"),
+					textPart("What is this about?"),
 				}),
 			},
-			want: true,
+			wantB64:    "JVBERi0xLjQK",
+			wantMime:   "application/pdf",
+			wantPrompt: "What is this about?",
+			wantOK:     true,
+		},
+		{
+			name: "empty mimeType defaults to application/pdf",
+			messages: []aguitypes.Message{
+				makeUserMsg([]aguitypes.InputContent{
+					docPart("abc123", ""),
+				}),
+			},
+			wantB64:  "abc123",
+			wantMime: "application/pdf",
+			wantOK:   true,
+		},
+		{
+			name: "uses last user message",
+			messages: []aguitypes.Message{
+				makeUserMsg([]aguitypes.InputContent{docPart("first", "application/pdf")}),
+				makeUserMsg([]aguitypes.InputContent{docPart("second", "application/pdf")}),
+			},
+			wantB64:  "second",
+			wantMime: "application/pdf",
+			wantOK:   true,
 		},
 		{
 			name: "URL-source document is skipped",
@@ -64,25 +92,37 @@ func TestHasDocumentPart(t *testing.T) {
 					},
 				}),
 			},
-			want: false,
+			wantOK: false,
 		},
 		{
 			name: "non-user message is skipped",
 			messages: []aguitypes.Message{
 				{
 					Role:    aguitypes.RoleAssistant,
-					Content: []aguitypes.InputContent{docPart("abc")},
+					Content: []aguitypes.InputContent{docPart("abc", "application/pdf")},
 				},
 			},
-			want: false,
+			wantOK: false,
 		},
 	}
 
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			got := hasDocumentPart(tc.messages)
-			if got != tc.want {
-				t.Errorf("hasDocumentPart()=%v want %v", got, tc.want)
+			b64, mime, prompt, ok := extractDocumentPart(tc.messages)
+			if ok != tc.wantOK {
+				t.Fatalf("ok=%v want %v", ok, tc.wantOK)
+			}
+			if !ok {
+				return
+			}
+			if b64 != tc.wantB64 {
+				t.Errorf("base64=%q want %q", b64, tc.wantB64)
+			}
+			if mime != tc.wantMime {
+				t.Errorf("mimeType=%q want %q", mime, tc.wantMime)
+			}
+			if prompt != tc.wantPrompt {
+				t.Errorf("prompt=%q want %q", prompt, tc.wantPrompt)
 			}
 		})
 	}
