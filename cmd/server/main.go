@@ -24,8 +24,12 @@ import (
 	"github.com/gofiber/fiber/v3/middleware/requestid"
 
 	"github.com/mattsp1290/ag-ui-go-server-example/internal/agent"
+	"github.com/mattsp1290/ag-ui-go-server-example/internal/audio"
 	"github.com/mattsp1290/ag-ui-go-server-example/internal/config"
+	"github.com/mattsp1290/ag-ui-go-server-example/internal/document"
+	"github.com/mattsp1290/ag-ui-go-server-example/internal/imagegen"
 	"github.com/mattsp1290/ag-ui-go-server-example/internal/runstore"
+	"github.com/mattsp1290/ag-ui-go-server-example/internal/vision"
 )
 
 func main() {
@@ -78,7 +82,7 @@ func main() {
 		Provider:      cfg.Provider,
 	}
 
-	app := fiber.New(fiber.Config{AppName: "ag-ui-go-server-example", BodyLimit: 4 * 1024 * 1024})
+	app := fiber.New(fiber.Config{AppName: "ag-ui-go-server-example", BodyLimit: 20 * 1024 * 1024})
 	app.Use(requestid.New())
 	if cfg.CORS {
 		app.Use(cors.New(cors.Config{
@@ -107,6 +111,10 @@ func main() {
 	defer stop()
 
 	app.Post("/agentic", agenticHandler(sigCtx, deps, logger))
+	app.Post("/image-gen", imagegen.Handler(sigCtx, logger))
+	app.Post("/vision", vision.Handler(sigCtx, logger))
+	app.Post("/audio", audio.Handler(sigCtx, logger))
+	app.Post("/document", document.Handler(sigCtx, logger))
 
 	addr := net.JoinHostPort(cfg.Host, strconv.Itoa(cfg.Port))
 	logger.Info("starting server", "addr", addr, "provider", cfg.Provider, "model", cfg.Model,
