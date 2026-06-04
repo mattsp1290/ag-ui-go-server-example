@@ -40,8 +40,10 @@ func TestTranscribeIntegration(t *testing.T) {
 	}
 	t.Logf("transcription: %q", result.Text)
 
-	// Whisper should recognise the word "savior" (case-insensitive, may include punctuation)
-	if !strings.Contains(strings.ToLower(result.Text), "savior") {
-		t.Errorf("expected transcription to contain %q, got %q", "savior", result.Text)
+	// Whisper transcribes either the American ("savior") or British ("saviour") spelling
+	// depending on the speaker's accent — accept both.
+	lower := strings.ToLower(result.Text)
+	if !strings.Contains(lower, "savior") && !strings.Contains(lower, "saviour") {
+		t.Errorf("expected transcription to contain savior/saviour, got %q", result.Text)
 	}
 }
