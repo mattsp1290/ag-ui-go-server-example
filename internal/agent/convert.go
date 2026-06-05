@@ -203,6 +203,13 @@ func toAGUIMessages(msgs []*schema.Message) []aguitypes.Message {
 			continue
 		}
 		out = append(out, am)
+		if m.Role == schema.Assistant && m.ReasoningContent != "" {
+			out = append(out, aguitypes.Message{
+				ID:      aguievents.GenerateMessageID(),
+				Role:    aguitypes.RoleReasoning,
+				Content: m.ReasoningContent,
+			})
+		}
 	}
 	return out
 }

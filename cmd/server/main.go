@@ -28,6 +28,7 @@ import (
 	"github.com/mattsp1290/ag-ui-go-server-example/internal/config"
 	"github.com/mattsp1290/ag-ui-go-server-example/internal/document"
 	"github.com/mattsp1290/ag-ui-go-server-example/internal/imagegen"
+	"github.com/mattsp1290/ag-ui-go-server-example/internal/reasoning"
 	"github.com/mattsp1290/ag-ui-go-server-example/internal/runstore"
 	"github.com/mattsp1290/ag-ui-go-server-example/internal/vision"
 )
@@ -115,6 +116,7 @@ func main() {
 	app.Post("/vision", vision.Handler(sigCtx, logger))
 	app.Post("/audio", audio.Handler(sigCtx, logger))
 	app.Post("/document", document.Handler(sigCtx, logger))
+	app.Post("/reasoning", reasoning.Handler(sigCtx, logger))
 
 	addr := net.JoinHostPort(cfg.Host, strconv.Itoa(cfg.Port))
 	logger.Info("starting server", "addr", addr, "provider", cfg.Provider, "model", cfg.Model,

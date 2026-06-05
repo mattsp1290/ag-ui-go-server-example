@@ -51,6 +51,13 @@ func TestScrubEncryptedValues(t *testing.T) {
 	if msgs[1].EncryptedValue != "secret-ev" {
 		t.Error("original slice was mutated")
 	}
+
+	// RoleReasoning is scrubbed just like any other role (role-agnostic path).
+	reasoning := []types.Message{{Role: types.RoleReasoning, EncryptedValue: "secret"}}
+	scrubbed := scrubEncryptedValues(reasoning)
+	if scrubbed[0].EncryptedValue != "" {
+		t.Errorf("EncryptedValue not scrubbed on RoleReasoning: %q", scrubbed[0].EncryptedValue)
+	}
 }
 
 // TestActivityDeltaAndReasoningEncryptedValue confirm the new emitter wrappers
