@@ -131,6 +131,8 @@ func main() {
 		}))
 	app.Post("/shared_state", streamHandler(sigCtx, logger, "shared_state",
 		agent.SharedState{Deps: deps}.Run))
+	app.Post("/predictive_state_updates", streamHandler(sigCtx, logger, "predictive_state_updates",
+		agent.PredictiveState{Deps: deps}.Run))
 	// /human_in_the_loop reads its per-request approval toggle from the request
 	// (header/query) before streaming, so it registers a thin handler that resolves
 	// the config and delegates to the shared streamRun.
