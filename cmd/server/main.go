@@ -74,6 +74,7 @@ func main() {
 
 	deps := &agent.Deps{
 		Model:         boundModel,
+		BaseModel:     base,
 		Tools:         tools,
 		Store:         runstore.New(),
 		AutoApprove:   cfg.AutoApprove,
@@ -120,6 +121,10 @@ func main() {
 	// SDK binds to. Each supplies only its run function to the shared streamHandler.
 	app.Post("/agentic_generative_ui", streamHandler(sigCtx, logger, "agentic_generative_ui",
 		agent.AgenticGenerativeUI{Pace: cfg.GenUIPace}.Run))
+	app.Post("/agentic_chat", streamHandler(sigCtx, logger, "agentic_chat",
+		func(ctx context.Context, emit *agent.Emitter, in *aguitypes.RunAgentInput, threadID, runID string) {
+			agent.Run(ctx, emit, in, deps, agent.AgenticChatConfig(), threadID, runID)
+		}))
 
 	addr := net.JoinHostPort(cfg.Host, strconv.Itoa(cfg.Port))
 	logger.Info("starting server", "addr", addr, "provider", cfg.Provider, "model", cfg.Model,
@@ -221,7 +226,7 @@ func agenticHandler(shutdownCtx context.Context, deps *agent.Deps, logger *slog.
 					emit.RunError("the agent crashed while handling this run")
 				}
 			}()
-			agent.Run(runCtx, emit, &in, deps, threadID, runID)
+			agent.Run(runCtx, emit, &in, deps, agent.DefaultRunConfig(), threadID, runID)
 			if err := emit.Err(); err != nil {
 				logger.Warn("event stream ended early", "thread", threadID, "run", runID, "error", err)
 			}

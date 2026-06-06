@@ -47,7 +47,7 @@ func TestStreamTurnEmitsReasoningThenText(t *testing.T) {
 		{Role: schema.Assistant, Content: " world"},
 	}}
 
-	msg, err := streamTurn(context.Background(), emit, fm, nil)
+	msg, err := streamTurn(context.Background(), emit, fm, nil, false)
 	if err != nil {
 		t.Fatalf("streamTurn: %v", err)
 	}
@@ -92,7 +92,7 @@ func TestStreamTurnClosesTextBeforeInterleavedReasoning(t *testing.T) {
 		{Role: schema.Assistant, Content: "second"},
 	}}
 
-	if _, err := streamTurn(context.Background(), emit, fm, nil); err != nil {
+	if _, err := streamTurn(context.Background(), emit, fm, nil, false); err != nil {
 		t.Fatalf("streamTurn: %v", err)
 	}
 	_ = w.Flush()

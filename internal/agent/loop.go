@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"strconv"
 
 	aguievents "github.com/ag-ui-protocol/ag-ui/sdks/community/go/pkg/core/events"
 	aguitypes "github.com/ag-ui-protocol/ag-ui/sdks/community/go/pkg/core/types"
@@ -25,19 +26,30 @@ const defaultSystemPrompt = "You are a helpful assistant operating in a read-onl
 	"You cannot create, modify, or delete files. Be concise."
 
 // ensureSystemPrompt guarantees a leading system message so the Codex endpoint
-// always receives instructions.
-func ensureSystemPrompt(messages []*schema.Message) []*schema.Message {
+// always receives instructions. prompt is the route's posture; an empty prompt
+// falls back to the default (which steers toward the read-only file_read tool).
+// Feature routes pass their own prompt so they never advertise file_read.
+func ensureSystemPrompt(messages []*schema.Message, prompt string) []*schema.Message {
 	for _, m := range messages {
 		if m.Role == schema.System {
 			return messages
 		}
 	}
-	return append([]*schema.Message{schema.SystemMessage(defaultSystemPrompt)}, messages...)
+	if prompt == "" {
+		prompt = defaultSystemPrompt
+	}
+	return append([]*schema.Message{schema.SystemMessage(prompt)}, messages...)
 }
 
 // Deps are the shared dependencies for running an agent turn.
+//
+// Deps is shared across all concurrent requests; never mutate it per request.
+// Per-request tool binding derives a new model from BaseModel via WithTools inside
+// Run (WithTools returns a fresh instance), so concurrent requests with different
+// client tools never clobber each other.
 type Deps struct {
-	Model         model.ToolCallingChatModel // already tool-bound
+	Model         model.ToolCallingChatModel // file_read-bound; used by /agentic and the ServerOnly path
+	BaseModel     model.ToolCallingChatModel // unbound; WithTools is applied per request on the ClientTools path
 	Tools         *Toolset
 	Store         *runstore.Store
 	AutoApprove   bool
@@ -58,8 +70,35 @@ type Deps struct {
 // concatenates the events of multiple /agentic responses for one runID and runs the
 // SDK's ValidateSequence over the merged log will see a second RUN_STARTED and reject
 // it — treat each response as its own sequence, not one continuous log.
-func Run(ctx context.Context, emit *Emitter, in *aguitypes.RunAgentInput, deps *Deps, threadID, runID string) {
+func Run(ctx context.Context, emit *Emitter, in *aguitypes.RunAgentInput, deps *Deps, cfg RunConfig, threadID, runID string) {
 	emit.RunStarted()
+
+	// Per-request model. On the ClientTools track, bind the client-defined tools
+	// (and optionally file_read) to a fresh instance derived from BaseModel —
+	// WithTools returns a new instance, so concurrent requests never clobber each
+	// other and the shared deps.Model/BaseModel are never mutated.
+	cm := deps.Model
+	clientNames := make(map[string]bool, len(in.Tools))
+	if cfg.ToolPolicy == ClientTools {
+		clientInfos, err := clientToolInfos(in.Tools)
+		if err != nil {
+			emit.RunError(err.Error())
+			return
+		}
+		for _, t := range in.Tools {
+			clientNames[t.Name] = true
+		}
+		infos := clientInfos
+		if cfg.ExposeFileRead {
+			infos = append(append([]*schema.ToolInfo{}, deps.Tools.Infos()...), clientInfos...)
+		}
+		bound, err := deps.BaseModel.WithTools(infos)
+		if err != nil {
+			emit.RunError("failed to bind client tools")
+			return
+		}
+		cm = bound
+	}
 
 	key := runstore.Key(threadID, runID)
 	var (
@@ -131,7 +170,7 @@ func Run(ctx context.Context, emit *Emitter, in *aguitypes.RunAgentInput, deps *
 	if st == nil {
 		st = NewState()
 		st.Seed(in.State)
-		messages = ensureSystemPrompt(toEinoMessages(in.Messages, deps.Provider))
+		messages = ensureSystemPrompt(toEinoMessages(in.Messages, deps.Provider), cfg.SystemPrompt)
 		emit.StateSnapshot(st.Snapshot())
 	}
 
@@ -152,7 +191,7 @@ func Run(ctx context.Context, emit *Emitter, in *aguitypes.RunAgentInput, deps *
 		}
 
 		emit.StepStarted("llm")
-		assistant, err := streamTurn(ctx, emit, deps.Model, messages)
+		assistant, err := streamTurn(ctx, emit, cm, messages, cfg.StreamToolCalls)
 		emit.StepFinished("llm")
 		if err != nil {
 			// A canceled context or an already-gated emitter means the client
@@ -182,6 +221,26 @@ func Run(ctx context.Context, emit *Emitter, in *aguitypes.RunAgentInput, deps *
 		}
 		if len(actionable) == 0 {
 			continue // only malformed calls this turn; let the model retry with the corrections
+		}
+
+		// Streaming tools-track (01/02/03): the TOOL_CALL_* already streamed during
+		// the {llm} step via streamTurn's tap, so do NOT re-emit (that would double
+		// every call). Route the finalized calls instead — never interrupt.
+		if cfg.StreamToolCalls {
+			serverCalls, clientCalls := classifyToolCalls(actionable, deps.Tools, clientNames)
+			if len(clientCalls) > 0 {
+				// Hand-back: the server can't execute client-defined tools. Finish
+				// with a plain RUN_FINISHED so the client fulfills and starts Run B.
+				// (Mixed server+client: also hand back; don't run the server tool —
+				// avoids the "who echoes the server result in Run B" ambiguity.)
+				emit.MessagesSnapshot(toAGUIMessages(messages))
+				emit.RunFinishedSuccess()
+				return
+			}
+			// Server-only this turn: execute (emits TOOL_CALL_RESULT only; START/ARGS/END
+			// already streamed) and continue the loop. No interrupt on this track.
+			settlePendingToolCalls(ctx, emit, deps, serverCalls, &messages, st, nil)
+			continue
 		}
 
 		emit.StepStarted("tools")
@@ -248,7 +307,16 @@ func Run(ctx context.Context, emit *Emitter, in *aguitypes.RunAgentInput, deps *
 // streamTurn streams one model turn, emitting reasoning and text events as
 // chunks arrive, and returns the merged assistant message (Extra preserved so
 // the codex model's reasoning items thread across turns).
-func streamTurn(ctx context.Context, emit *Emitter, cm model.ToolCallingChatModel, messages []*schema.Message) (*schema.Message, error) {
+//
+// When streamToolCalls is true, it also surfaces tool calls live: as the model
+// streams a call (OPEN chunk with id+name → arg-fragment chunks → empty CLOSE
+// chunk), it emits TOOL_CALL_START (lazily, once a non-empty id AND name are
+// known — buffering arg fragments until then, since the SDK rejects an empty
+// toolCallId), TOOL_CALL_ARGS per non-empty fragment, and TOOL_CALL_END for every
+// opened call at stream EOF. Callers that stream MUST NOT also emitToolProposal
+// for the same calls (that double-emits). When false, tool calls are left for the
+// caller to surface post-turn.
+func streamTurn(ctx context.Context, emit *Emitter, cm model.ToolCallingChatModel, messages []*schema.Message, streamToolCalls bool) (*schema.Message, error) {
 	sr, err := cm.Stream(ctx, messages)
 	if err != nil {
 		return nil, err
@@ -260,11 +328,74 @@ func streamTurn(ctx context.Context, emit *Emitter, cm model.ToolCallingChatMode
 	var reasoningID string // assigned a fresh id each time a reasoning block opens
 	textOpen, reasoningOpen := false, false
 
+	// Streaming tool-call tap state, keyed by tool-call identity (Index, stable per
+	// call across OPEN/delta/CLOSE chunks).
+	type tcStream struct {
+		started  bool
+		id, name string
+		buffered []string // arg fragments held until id+name are known
+	}
+	tcs := map[string]*tcStream{}
+	var tcOrder []string
+
 	closeReasoning := func() {
 		if reasoningOpen {
 			emit.ReasoningMessageEnd(reasoningID)
 			emit.ReasoningEnd(reasoningID)
 			reasoningOpen = false
+		}
+	}
+	closeText := func() {
+		if textOpen {
+			emit.TextEnd(textID)
+			textOpen = false
+		}
+	}
+	// streamToolCallChunk surfaces one chunk's tool-call fragments live.
+	streamToolCallChunk := func(chunk *schema.Message) {
+		if len(chunk.ToolCalls) == 0 {
+			return
+		}
+		// A tool call ends any open text/reasoning block so blocks never overlap.
+		closeReasoning()
+		closeText()
+		for _, tc := range chunk.ToolCalls {
+			key := toolCallKey(tc)
+			st := tcs[key]
+			if st == nil {
+				st = &tcStream{}
+				tcs[key] = st
+				tcOrder = append(tcOrder, key)
+			}
+			if tc.Function.Name != "" {
+				st.name = tc.Function.Name
+			}
+			if tc.ID != "" {
+				st.id = tc.ID
+			}
+			frag := tc.Function.Arguments
+			switch {
+			case st.started:
+				emit.ToolArgs(st.id, frag) // emitter skips empty
+			case st.id != "" && st.name != "":
+				emit.ToolStart(st.id, st.name)
+				st.started = true
+				for _, b := range st.buffered {
+					emit.ToolArgs(st.id, b)
+				}
+				st.buffered = nil
+				emit.ToolArgs(st.id, frag)
+			case frag != "":
+				st.buffered = append(st.buffered, frag) // hold until id+name known
+			}
+		}
+	}
+	// endStreamedToolCalls closes every opened call at stream EOF.
+	endStreamedToolCalls := func() {
+		for _, key := range tcOrder {
+			if st := tcs[key]; st.started {
+				emit.ToolEnd(st.id)
+			}
 		}
 	}
 	// closeOpenBlocks balances any started message block. Deferred so that an
@@ -321,12 +452,31 @@ func streamTurn(ctx context.Context, emit *Emitter, cm model.ToolCallingChatMode
 			}
 			emit.TextContent(textID, chunk.Content)
 		}
+		if streamToolCalls {
+			streamToolCallChunk(chunk)
+		}
 		chunks = append(chunks, chunk)
+	}
+	if streamToolCalls {
+		endStreamedToolCalls()
 	}
 	if len(chunks) == 0 {
 		return nil, fmt.Errorf("empty model stream")
 	}
 	return schema.ConcatMessages(chunks)
+}
+
+// toolCallKey identifies a streaming tool call stably across its OPEN/delta/CLOSE
+// chunks. Index is non-nil on every chunk from both providers; the fallbacks keep
+// a malformed stream from collapsing distinct calls onto one key.
+func toolCallKey(tc schema.ToolCall) string {
+	if tc.Index != nil {
+		return "i" + strconv.Itoa(*tc.Index)
+	}
+	if tc.ID != "" {
+		return "d" + tc.ID
+	}
+	return "p0"
 }
 
 // validateToolCalls partitions model-emitted tool calls into the calls kept on the
