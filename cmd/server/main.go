@@ -129,6 +129,8 @@ func main() {
 		func(ctx context.Context, emit *agent.Emitter, in *aguitypes.RunAgentInput, threadID, runID string) {
 			agent.Run(ctx, emit, in, deps, agent.ToolBasedGenerativeUIConfig(), threadID, runID)
 		}))
+	app.Post("/shared_state", streamHandler(sigCtx, logger, "shared_state",
+		agent.SharedState{Deps: deps}.Run))
 	// /human_in_the_loop reads its per-request approval toggle from the request
 	// (header/query) before streaming, so it registers a thin handler that resolves
 	// the config and delegates to the shared streamRun.
