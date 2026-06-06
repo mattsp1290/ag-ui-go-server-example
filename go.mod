@@ -18,6 +18,7 @@ require (
 	github.com/ag-ui-protocol/ag-ui/sdks/community/go v0.0.0-00010101000000-000000000000
 	github.com/cloudwego/eino v0.9.2
 	github.com/cloudwego/eino-ext/components/model/openai v0.1.13
+	github.com/evanphx/json-patch v0.5.2
 	github.com/gofiber/fiber/v3 v3.3.0
 	github.com/mattsp1290/eino-providers v0.0.0-00010101000000-000000000000
 	github.com/mattsp1290/eino-tools v0.0.0-00010101000000-000000000000
@@ -37,7 +38,6 @@ require (
 	github.com/cloudwego/eino-ext/libs/acl/openai v0.1.17 // indirect
 	github.com/dustin/go-humanize v1.0.1 // indirect
 	github.com/eino-contrib/jsonschema v1.0.3 // indirect
-	github.com/evanphx/json-patch v0.5.2 // indirect
 	github.com/gofiber/schema v1.7.1 // indirect
 	github.com/gofiber/utils/v2 v2.0.6 // indirect
 	github.com/gofrs/flock v0.13.0 // indirect

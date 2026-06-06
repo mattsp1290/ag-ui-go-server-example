@@ -4,6 +4,7 @@ package config
 import (
 	"os"
 	"strconv"
+	"time"
 )
 
 const (
@@ -37,6 +38,10 @@ type Config struct {
 	MaxIterations int
 	// CORS enables permissive CORS for local UI development.
 	CORS bool
+	// GenUIPace is the delay between step transitions on /agentic_generative_ui
+	// (env AGENTIC_UI_PACE_MS). A visible delay is the point of that demo; an
+	// instantaneous run defeats it.
+	GenUIPace time.Duration
 }
 
 // Load reads configuration from the environment, applying defaults.
@@ -65,6 +70,7 @@ func Load() Config {
 		AutoApprove:   envBool("AGENT_AUTO_APPROVE", false),
 		MaxIterations: envInt("AGENT_MAX_ITERATIONS", DefaultMaxIterations),
 		CORS:          envBool("CORS_ENABLED", true),
+		GenUIPace:     time.Duration(envInt("AGENTIC_UI_PACE_MS", 600)) * time.Millisecond,
 	}
 }
 
