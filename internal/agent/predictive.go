@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"io"
+	"regexp"
 	"strings"
 
 	"github.com/ag-ui-protocol/ag-ui/sdks/community/go/pkg/core/events"
@@ -52,10 +53,15 @@ func (p PredictiveState) Run(ctx context.Context, emit *Emitter, in *aguitypes.R
 	// The committed value is computed from the final generation, not "promoted"
 	// from the last prediction, so a dropped/garbled prediction can't corrupt it.
 	steps := splitSteps(full)
+	committed := false
 	if len(steps) > 0 {
-		commit := []events.JSONPatchOperation{{Op: "replace", Path: "/recipe/steps", Value: steps}}
+		// `add` (create-or-replace for an object member) so the commit lands even if
+		// the client-seeded recipe had no pre-existing "steps" key (replace would
+		// fail there and silently drop the generated steps).
+		commit := []events.JSONPatchOperation{{Op: "add", Path: "/recipe/steps", Value: steps}}
 		if err := doc.Apply(commit); err == nil {
 			emit.StateDelta(commit) // committed (not under /_predictive)
+			committed = true
 		}
 	}
 	// Remove the draft namespace (itself a predictive op — clients that ignore
@@ -65,14 +71,19 @@ func (p PredictiveState) Run(ctx context.Context, emit *Emitter, in *aguitypes.R
 		emit.StateDelta(clear)
 	}
 
-	// Short committed-state narration.
+	// Narrate the committed state honestly: don't claim an update on an empty
+	// generation.
+	summary := "Updated the recipe steps."
+	if !committed {
+		summary = "I couldn't produce any steps to update."
+	}
 	msgID := events.GenerateMessageID()
 	emit.TextStart(msgID)
-	emit.TextContent(msgID, "Updated the recipe steps.")
+	emit.TextContent(msgID, summary)
 	emit.TextEnd(msgID)
 
 	emit.MessagesSnapshot([]aguitypes.Message{
-		{ID: msgID, Role: aguitypes.RoleAssistant, Content: "Updated the recipe steps."},
+		{ID: msgID, Role: aguitypes.RoleAssistant, Content: summary},
 	})
 	emit.RunFinishedSuccess()
 }
@@ -124,13 +135,20 @@ func (p PredictiveState) streamPredictive(ctx context.Context, emit *Emitter, do
 	return b.String(), true
 }
 
+// stepListMarker matches a single leading ordered/unordered list marker ("1.",
+// "2)", "-", "*") followed by whitespace — and ONLY that. A character-class trim
+// would corrupt legitimate steps that begin with a number ("2 eggs, beaten") or a
+// hyphen, silently mangling the committed recipe.
+var stepListMarker = regexp.MustCompile(`^\s*(?:\d+[.)]|[-*])\s+`)
+
 // splitSteps turns the model's newline-separated step text into a steps array,
-// trimming blank lines and any leading list markers.
+// trimming blank lines and a leading list marker (but not legitimate leading text).
 func splitSteps(text string) []any {
 	var steps []any
 	for _, line := range strings.Split(text, "\n") {
 		s := strings.TrimSpace(line)
-		s = strings.TrimLeft(s, "-*0123456789. \t")
+		s = stepListMarker.ReplaceAllString(s, "")
+		s = strings.TrimSpace(s)
 		if s != "" {
 			steps = append(steps, s)
 		}

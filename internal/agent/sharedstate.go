@@ -70,7 +70,9 @@ func (s SharedState) Run(ctx context.Context, emit *Emitter, in *aguitypes.RunAg
 		}
 		messages = append(messages, assistant)
 
-		actionable := validateToolCalls(emit, s.Deps.Logger, assistant, &messages)
+		// Quiet validation: this route's contract is STATE_* only, no tool-call
+		// events — so a malformed call must not leak a TOOL_CALL_RESULT.
+		actionable := validateToolCallsQuiet(s.Deps.Logger, assistant, &messages)
 		if len(assistant.ToolCalls) == 0 {
 			// Final text answer.
 			emit.MessagesSnapshot(toAGUIMessages(messages))
@@ -138,8 +140,8 @@ func recipeEditTool() *schema.ToolInfo {
 }
 
 type recipeChanges struct {
-	Title    *string `json:"title"`
-	Servings *int    `json:"servings"`
+	Title    *string      `json:"title"`
+	Servings *json.Number `json:"servings"` // json.Number so 4 and 4.0 both parse (LLMs emit trailing .0)
 	AddIngredients []struct {
 		Name   string `json:"name"`
 		Amount string `json:"amount"`
@@ -158,10 +160,11 @@ func applyRecipeChanges(emit *Emitter, doc *DocState, tc schema.ToolCall) string
 		return `{"error":"could not parse recipe changes"}`
 	}
 
-	applied := 0
+	applied, skipped := 0, 0
 	apply := func(op events.JSONPatchOperation) {
 		if err := doc.Apply([]events.JSONPatchOperation{op}); err != nil {
-			return // skip an op that doesn't apply (e.g. out-of-range remove)
+			skipped++ // an op that doesn't apply (e.g. out-of-range remove) is reported, not fatal
+			return
 		}
 		emit.StateDelta([]events.JSONPatchOperation{op})
 		applied++
@@ -171,7 +174,13 @@ func applyRecipeChanges(emit *Emitter, doc *DocState, tc schema.ToolCall) string
 		apply(events.JSONPatchOperation{Op: "replace", Path: "/recipe/title", Value: *ch.Title})
 	}
 	if ch.Servings != nil {
-		apply(events.JSONPatchOperation{Op: "replace", Path: "/recipe/servings", Value: *ch.Servings})
+		// Accept any JSON number; the document carries servings as a number, and a
+		// model may emit 4 or 4.0. A non-numeric value is skipped, not fatal.
+		if n, err := ch.Servings.Float64(); err == nil {
+			apply(events.JSONPatchOperation{Op: "replace", Path: "/recipe/servings", Value: int(n)})
+		} else {
+			skipped++
+		}
 	}
 	for _, ing := range ch.AddIngredients {
 		v := map[string]any{"name": ing.Name}
@@ -190,5 +199,7 @@ func applyRecipeChanges(emit *Emitter, doc *DocState, tc schema.ToolCall) string
 		apply(events.JSONPatchOperation{Op: "add", Path: "/recipe/steps/-", Value: st})
 	}
 
-	return fmt.Sprintf(`{"applied":%d}`, applied)
+	// Report skipped ops so the model can tell the user a change was rejected
+	// (e.g. "ingredient index 9 didn't exist") rather than silently swallowing it.
+	return fmt.Sprintf(`{"applied":%d,"skipped":%d}`, applied, skipped)
 }

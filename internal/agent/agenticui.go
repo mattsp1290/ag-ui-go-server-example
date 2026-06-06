@@ -134,9 +134,12 @@ func lastUserText(in *aguitypes.RunAgentInput) string {
 	return ""
 }
 
+// truncate caps a string to n runes (not bytes), so a multibyte character is never
+// split into invalid UTF-8 in the step description.
 func truncate(s string, n int) string {
-	if len(s) <= n {
+	r := []rune(s)
+	if len(r) <= n {
 		return s
 	}
-	return strings.TrimSpace(s[:n]) + "…"
+	return strings.TrimSpace(string(r[:n])) + "…"
 }

@@ -21,16 +21,6 @@ const (
 	ClientTools
 )
 
-// StateModel selects which state surface a route uses.
-type StateModel int
-
-const (
-	// LifecycleState is the agent-lifecycle state (status/filesRead/toolCalls).
-	LifecycleState StateModel = iota
-	// NoAgentState means the route owns its own state emission (no lifecycle state).
-	NoAgentState
-)
-
 // RunConfig parameterizes a single route's behavior over the shared agent loop.
 // The zero value is the /agentic default (ServerOnly, lifecycle state, interrupt
 // per AutoApprove, post-turn emitToolProposal).
@@ -48,8 +38,6 @@ type RunConfig struct {
 	// post-turn emitToolProposal. The two are mutually exclusive (never both, or
 	// every call double-emits). Only the tools track sets this.
 	StreamToolCalls bool
-	// StateModel selects the state surface.
-	StateModel StateModel
 }
 
 // DefaultRunConfig is /agentic's behavior: unchanged from before the refactor.
@@ -63,7 +51,6 @@ func AgenticChatConfig() RunConfig {
 		ExposeFileRead:  false,
 		NeverInterrupt:  true,
 		StreamToolCalls: true,
-		StateModel:      LifecycleState,
 	}
 }
 
@@ -159,16 +146,19 @@ func toJSONSchema(params any) (*jsonschema.Schema, error) {
 	return &s, nil
 }
 
-// classifyToolCalls splits actionable calls into server-owned (executable here)
-// and client-defined (handed back). An unknown name is routed to the server path,
-// where settlePendingToolCalls answers it with an "unknown tool" error the model
-// can recover from — never a panic.
-func classifyToolCalls(calls []schema.ToolCall, serverTools *Toolset, clientNames map[string]bool) (server, client []schema.ToolCall) {
+// classifyToolCalls splits actionable calls into client-defined (handed back to
+// the client) and everything else (the server path). A name in clientNames is a
+// client tool; any other name — a server-owned tool like file_read, or a
+// hallucinated unknown name — goes to the server path, where settlePendingToolCalls
+// runs it (or answers an unknown name with an "unknown tool" error the model can
+// recover from). The server toolset isn't consulted here: known-server and unknown
+// names are handled identically downstream, so distinguishing them would be a
+// no-op.
+func classifyToolCalls(calls []schema.ToolCall, clientNames map[string]bool) (server, client []schema.ToolCall) {
 	for _, tc := range calls {
-		switch {
-		case clientNames[tc.Function.Name]:
+		if clientNames[tc.Function.Name] {
 			client = append(client, tc)
-		default:
+		} else {
 			server = append(server, tc)
 		}
 	}

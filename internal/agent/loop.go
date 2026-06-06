@@ -227,12 +227,22 @@ func Run(ctx context.Context, emit *Emitter, in *aguitypes.RunAgentInput, deps *
 		// the {llm} step via streamTurn's tap, so do NOT re-emit (that would double
 		// every call). Route the finalized calls instead — never interrupt.
 		if cfg.StreamToolCalls {
-			serverCalls, clientCalls := classifyToolCalls(actionable, deps.Tools, clientNames)
+			serverCalls, clientCalls := classifyToolCalls(actionable, clientNames)
 			if len(clientCalls) > 0 {
 				// Hand-back: the server can't execute client-defined tools. Finish
 				// with a plain RUN_FINISHED so the client fulfills and starts Run B.
 				// (Mixed server+client: also hand back; don't run the server tool —
 				// avoids the "who echoes the server result in Run B" ambiguity.)
+				//
+				// Any server call in this turn won't be executed, so answer it with a
+				// synthetic tool result; otherwise the MESSAGES_SNAPSHOT would carry an
+				// assistant tool call with no matching tool response, which some SDK
+				// sequence validators reject. (Only reachable if the model hallucinates
+				// an unknown tool alongside a real client call — a narrow case.)
+				for _, sc := range serverCalls {
+					messages = append(messages, schema.ToolMessage(
+						`{"error":"not executed: a client tool in this turn took priority"}`, sc.ID))
+				}
 				emit.MessagesSnapshot(toAGUIMessages(messages))
 				emit.RunFinishedSuccess()
 				return
@@ -248,8 +258,11 @@ func Run(ctx context.Context, emit *Emitter, in *aguitypes.RunAgentInput, deps *
 			emitToolProposal(emit, tc)
 		}
 
-		if !deps.AutoApprove {
+		if !deps.AutoApprove && !cfg.NeverInterrupt {
 			// Human-in-the-loop: pause for approval and finish with an interrupt.
+			// cfg.NeverInterrupt forces the auto-execute path below even when
+			// AutoApprove is off — feature routes the Dart client can't resume set
+			// it so a stray non-streaming config can never deadlock on an interrupt.
 			interrupts := make([]aguitypes.Interrupt, 0, len(actionable))
 			for _, tc := range actionable {
 				emit.ActivitySnapshot(aguievents.GenerateMessageID(), "approval_request",
@@ -390,23 +403,30 @@ func streamTurn(ctx context.Context, emit *Emitter, cm model.ToolCallingChatMode
 			}
 		}
 	}
-	// endStreamedToolCalls closes every opened call at stream EOF.
+	// endStreamedToolCalls closes every opened call. Text/reasoning are closed first
+	// so an open TEXT block (a model that streamed text after the tool call) is
+	// terminated before the tool-call END, keeping blocks non-overlapping.
 	endStreamedToolCalls := func() {
+		closeReasoning()
+		closeText()
 		for _, key := range tcOrder {
 			if st := tcs[key]; st.started {
 				emit.ToolEnd(st.id)
+				st.started = false // idempotent: never emit END twice for the same call
 			}
 		}
 	}
-	// closeOpenBlocks balances any started message block. Deferred so that an
-	// early return on a mid-stream Recv error still closes the open TEXT/REASONING
-	// block on the wire, rather than leaving a client hanging on an open message.
+	// closeOpenBlocks balances any started message block. Deferred so that EVERY
+	// exit path — EOF, a mid-stream Recv error, or ctx cancel — closes open
+	// TEXT/REASONING blocks AND opened tool calls on the wire, rather than leaving a
+	// client hanging on a dangling TOOL_CALL_START or open message.
 	closeOpenBlocks := func() {
-		closeReasoning()
-		if textOpen {
-			emit.TextEnd(textID)
-			textOpen = false
+		if streamToolCalls {
+			endStreamedToolCalls()
+			return // endStreamedToolCalls already closed reasoning+text
 		}
+		closeReasoning()
+		closeText()
 	}
 	defer closeOpenBlocks()
 
@@ -457,9 +477,8 @@ func streamTurn(ctx context.Context, emit *Emitter, cm model.ToolCallingChatMode
 		}
 		chunks = append(chunks, chunk)
 	}
-	if streamToolCalls {
-		endStreamedToolCalls()
-	}
+	// TOOL_CALL_END for every opened call is emitted by the deferred closeOpenBlocks,
+	// so it fires on the EOF path AND on a mid-stream error (no dangling START).
 	if len(chunks) == 0 {
 		return nil, fmt.Errorf("empty model stream")
 	}
@@ -491,22 +510,36 @@ func toolCallKey(tc schema.ToolCall) string {
 // encoder, which rejects it — a rejection the emitter would otherwise misread as a
 // client disconnect, silently killing the run with no RUN_ERROR.
 func validateToolCalls(emit *Emitter, logger *slog.Logger, assistant *schema.Message, messages *[]*schema.Message) []schema.ToolCall {
+	return validateToolCallsOpt(emit, logger, assistant, messages, true)
+}
+
+// validateToolCallsQuiet behaves like validateToolCalls but does NOT emit a
+// TOOL_CALL_RESULT event for a malformed call — it only threads the corrective
+// tool-role message back into the conversation. Routes whose contract forbids
+// tool-call events on the wire (e.g. /shared_state, /predictive_state_updates) use
+// this so a malformed model call can't leak a TOOL_CALL_RESULT.
+func validateToolCallsQuiet(logger *slog.Logger, assistant *schema.Message, messages *[]*schema.Message) []schema.ToolCall {
+	return validateToolCallsOpt(nil, logger, assistant, messages, false)
+}
+
+func validateToolCallsOpt(emit *Emitter, logger *slog.Logger, assistant *schema.Message, messages *[]*schema.Message, emitResults bool) []schema.ToolCall {
 	kept := make([]schema.ToolCall, 0, len(assistant.ToolCalls))
 	actionable := make([]schema.ToolCall, 0, len(assistant.ToolCalls))
+	corrective := func(tc schema.ToolCall, result string) {
+		if emitResults {
+			emit.ToolResult(aguievents.GenerateMessageID(), tc.ID, result)
+		}
+		*messages = append(*messages, schema.ToolMessage(result, tc.ID))
+		kept = append(kept, tc)
+	}
 	for _, tc := range assistant.ToolCalls {
 		switch {
 		case tc.ID == "":
 			logger.Warn("dropping tool call with empty id", "name", tc.Function.Name)
 		case tc.Function.Name == "":
-			result := `{"error":"tool call had an empty function name"}`
-			emit.ToolResult(aguievents.GenerateMessageID(), tc.ID, result)
-			*messages = append(*messages, schema.ToolMessage(result, tc.ID))
-			kept = append(kept, tc)
+			corrective(tc, `{"error":"tool call had an empty function name"}`)
 		case !json.Valid([]byte(tc.Function.Arguments)):
-			result := fmt.Sprintf(`{"error":"tool arguments for %q were not valid JSON"}`, tc.Function.Name)
-			emit.ToolResult(aguievents.GenerateMessageID(), tc.ID, result)
-			*messages = append(*messages, schema.ToolMessage(result, tc.ID))
-			kept = append(kept, tc)
+			corrective(tc, fmt.Sprintf(`{"error":"tool arguments for %q were not valid JSON"}`, tc.Function.Name))
 		default:
 			kept = append(kept, tc)
 			actionable = append(actionable, tc)
