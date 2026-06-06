@@ -47,7 +47,11 @@ func (s SharedState) Run(ctx context.Context, emit *Emitter, in *aguitypes.RunAg
 		return
 	}
 
-	messages := ensureSystemPrompt(toEinoMessages(in.Messages, s.Deps.Provider), sharedStateSystemPrompt)
+	// Inject the current recipe into the model's context. The recipe is shared STATE,
+	// not part of the message history, so without this the model cannot see the title,
+	// servings, ingredients, or steps it is supposed to collaborate on (it would answer
+	// questions blind and could not compute edits like "double the servings").
+	messages := ensureSystemPrompt(toEinoMessages(in.Messages, s.Deps.Provider), sharedStateSystemPrompt+currentRecipeContext(doc))
 
 	maxIter := s.Deps.MaxIterations
 	if maxIter <= 0 {
@@ -92,6 +96,18 @@ func (s SharedState) Run(ctx context.Context, emit *Emitter, in *aguitypes.RunAg
 
 	emit.MessagesSnapshot(toAGUIMessages(messages))
 	emit.RunError(fmt.Sprintf("agent did not converge within %d iterations", maxIter))
+}
+
+// currentRecipeContext renders the current recipe as a system-prompt suffix so the
+// model can see the shared state. Returns "" if the document can't be marshaled.
+func currentRecipeContext(doc *DocState) string {
+	b, err := json.Marshal(doc.Snapshot())
+	if err != nil {
+		return ""
+	}
+	return "\n\nThe current shared recipe is:\n" + string(b) +
+		"\nUse these exact values when answering questions or computing edits " +
+		"(e.g. when doubling servings or removing an ingredient by position)."
 }
 
 // seedRecipe builds the working document from client-seeded state. It adopts
@@ -201,5 +217,9 @@ func applyRecipeChanges(emit *Emitter, doc *DocState, tc schema.ToolCall) string
 
 	// Report skipped ops so the model can tell the user a change was rejected
 	// (e.g. "ingredient index 9 didn't exist") rather than silently swallowing it.
+	// Include the updated recipe so a follow-up edit in the same run sees current state.
+	if b, err := json.Marshal(doc.Snapshot()); err == nil {
+		return fmt.Sprintf(`{"applied":%d,"skipped":%d,"recipe":%s}`, applied, skipped, string(b))
+	}
 	return fmt.Sprintf(`{"applied":%d,"skipped":%d}`, applied, skipped)
 }
