@@ -91,7 +91,7 @@ func runWithModel(t *testing.T, cm model.ToolCallingChatModel, in *aguitypes.Run
 		MaxIterations: maxIter,
 		Logger:        slog.New(slog.NewTextHandler(io.Discard, nil)),
 	}
-	Run(context.Background(), emit, in, deps, in.ThreadID, in.RunID)
+	Run(context.Background(), emit, in, deps, DefaultRunConfig(), in.ThreadID, in.RunID)
 	_ = w.Flush()
 	return buf.String()
 }
@@ -220,7 +220,7 @@ func TestStreamTurnConcurrentSharedModel(t *testing.T) {
 			var buf bytes.Buffer
 			w := bufio.NewWriter(&buf)
 			emit := NewEmitter(context.Background(), w, sse.NewSSEWriter(), "t", "r", nil)
-			msg, err := streamTurn(context.Background(), emit, shared, nil)
+			msg, err := streamTurn(context.Background(), emit, shared, nil, false)
 			if err != nil {
 				t.Errorf("streamTurn: %v", err)
 				return
