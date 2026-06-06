@@ -3,6 +3,7 @@ package agent
 import (
 	"encoding/json"
 	"fmt"
+	"strings"
 
 	aguitypes "github.com/ag-ui-protocol/ag-ui/sdks/community/go/pkg/core/types"
 	"github.com/cloudwego/eino/schema"
@@ -71,6 +72,43 @@ const agenticChatSystemPrompt = "You are a helpful assistant. When a user reques
 	"schema. You do not execute those tools yourself — you propose the call and the client " +
 	"fulfills it, then continues the conversation with the result. If no tool fits, answer " +
 	"directly and concisely."
+
+// ToolBasedGenerativeUIConfig is the /tool_based_generative_ui posture: prefer the
+// generative-UI rendering tool over a prose answer for fitting prompts. It is 01's
+// machinery (client tools + streaming tap) with a stronger prefer-the-tool prompt.
+func ToolBasedGenerativeUIConfig() RunConfig {
+	cfg := AgenticChatConfig()
+	cfg.SystemPrompt = genUISystemPrompt
+	return cfg
+}
+
+const genUISystemPrompt = "You are a generative-UI assistant. When the user's request can be " +
+	"presented through one of the provided rendering tools (for example a tool that renders " +
+	"structured content such as a card), you MUST call that tool with well-formed structured " +
+	"arguments that satisfy its schema, rather than answering in prose. Only answer in plain " +
+	"text when no provided tool fits the request."
+
+// HumanInTheLoopConfig is the /human_in_the_loop posture: route consequential
+// actions through a client-defined approval tool and wait for the user's decision
+// (carried back as a role:tool result on the follow-up run). It is 01's machinery
+// with an approval-gating prompt. The per-request approval value ("off" disables
+// the gate, serving plain agentic chat; anything else — including empty — keeps it
+// on) comes from the X-AG-Approval header or the ?approval= query param.
+func HumanInTheLoopConfig(approval string) RunConfig {
+	cfg := AgenticChatConfig()
+	if strings.EqualFold(approval, "off") {
+		return cfg // ungated: behave like /agentic_chat
+	}
+	cfg.SystemPrompt = humanInTheLoopSystemPrompt
+	return cfg
+}
+
+const humanInTheLoopSystemPrompt = "You are a careful assistant. Before performing any " +
+	"consequential or irreversible action (deleting, sending, purchasing, or modifying data), " +
+	"you MUST first call the provided approval tool with a clear, human-readable summary of " +
+	"what you intend to do, and wait for the result. Proceed only after the user approves; if " +
+	"the user rejects, acknowledge it and do not perform the action. For non-consequential " +
+	"requests, answer directly."
 
 // clientToolInfos converts AG-UI client tool definitions (RunAgentInput.tools)
 // into eino ToolInfos the model can be bound to. Errors (empty/duplicate names,

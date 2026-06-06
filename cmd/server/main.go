@@ -125,6 +125,21 @@ func main() {
 		func(ctx context.Context, emit *agent.Emitter, in *aguitypes.RunAgentInput, threadID, runID string) {
 			agent.Run(ctx, emit, in, deps, agent.AgenticChatConfig(), threadID, runID)
 		}))
+	app.Post("/tool_based_generative_ui", streamHandler(sigCtx, logger, "tool_based_generative_ui",
+		func(ctx context.Context, emit *agent.Emitter, in *aguitypes.RunAgentInput, threadID, runID string) {
+			agent.Run(ctx, emit, in, deps, agent.ToolBasedGenerativeUIConfig(), threadID, runID)
+		}))
+	// /human_in_the_loop reads its per-request approval toggle from the request
+	// (header/query) before streaming, so it registers a thin handler that resolves
+	// the config and delegates to the shared streamRun.
+	hilSW := sse.NewSSEWriter().WithLogger(logger)
+	app.Post("/human_in_the_loop", func(c fiber.Ctx) error {
+		cfg := agent.HumanInTheLoopConfig(approvalMode(c))
+		return streamRun(c, sigCtx, logger, hilSW, "human_in_the_loop",
+			func(ctx context.Context, emit *agent.Emitter, in *aguitypes.RunAgentInput, threadID, runID string) {
+				agent.Run(ctx, emit, in, deps, cfg, threadID, runID)
+			})
+	})
 
 	addr := net.JoinHostPort(cfg.Host, strconv.Itoa(cfg.Port))
 	logger.Info("starting server", "addr", addr, "provider", cfg.Provider, "model", cfg.Model,
@@ -146,40 +161,61 @@ func streamHandler(shutdownCtx context.Context, logger *slog.Logger, name string
 	run func(ctx context.Context, emit *agent.Emitter, in *aguitypes.RunAgentInput, threadID, runID string)) fiber.Handler {
 	sw := sse.NewSSEWriter().WithLogger(logger)
 	return func(c fiber.Ctx) error {
-		var in aguitypes.RunAgentInput
-		if err := json.Unmarshal(c.Body(), &in); err != nil {
-			return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "invalid request body"})
-		}
-
-		threadID := in.ThreadID
-		if threadID == "" {
-			threadID = aguievents.GenerateThreadID()
-		}
-		runID := in.RunID
-		if runID == "" {
-			runID = aguievents.GenerateRunID()
-		}
-
-		c.Set("Content-Type", "text/event-stream")
-		c.Set("Cache-Control", "no-cache")
-		c.Set("Connection", "keep-alive")
-
-		return c.SendStreamWriter(func(w *bufio.Writer) {
-			runCtx, cancel := context.WithCancel(shutdownCtx)
-			defer cancel()
-			emit := agent.NewEmitter(runCtx, w, sw, threadID, runID, cancel)
-			defer func() {
-				if r := recover(); r != nil {
-					logger.Error("handler panicked", "route", name, "thread", threadID, "run", runID, "panic", r)
-					emit.RunError("the agent crashed while handling this run")
-				}
-			}()
-			run(runCtx, emit, &in, threadID, runID)
-			if err := emit.Err(); err != nil {
-				logger.Warn("event stream ended early", "route", name, "thread", threadID, "run", runID, "error", err)
-			}
-		})
+		return streamRun(c, shutdownCtx, logger, sw, name, run)
 	}
+}
+
+// streamRun is the inner SSE-handler body, shared by streamHandler and routes that
+// must read request metadata (e.g. /human_in_the_loop reads its approval header)
+// before the stream writer runs — the fiber.Ctx is recycled once the handler
+// returns, so any header/query read must happen synchronously here, not inside the
+// stream-writer closure.
+func streamRun(c fiber.Ctx, shutdownCtx context.Context, logger *slog.Logger, sw *sse.SSEWriter, name string,
+	run func(ctx context.Context, emit *agent.Emitter, in *aguitypes.RunAgentInput, threadID, runID string)) error {
+	var in aguitypes.RunAgentInput
+	if err := json.Unmarshal(c.Body(), &in); err != nil {
+		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "invalid request body"})
+	}
+
+	threadID := in.ThreadID
+	if threadID == "" {
+		threadID = aguievents.GenerateThreadID()
+	}
+	runID := in.RunID
+	if runID == "" {
+		runID = aguievents.GenerateRunID()
+	}
+
+	c.Set("Content-Type", "text/event-stream")
+	c.Set("Cache-Control", "no-cache")
+	c.Set("Connection", "keep-alive")
+
+	return c.SendStreamWriter(func(w *bufio.Writer) {
+		runCtx, cancel := context.WithCancel(shutdownCtx)
+		defer cancel()
+		emit := agent.NewEmitter(runCtx, w, sw, threadID, runID, cancel)
+		defer func() {
+			if r := recover(); r != nil {
+				logger.Error("handler panicked", "route", name, "thread", threadID, "run", runID, "panic", r)
+				emit.RunError("the agent crashed while handling this run")
+			}
+		}()
+		run(runCtx, emit, &in, threadID, runID)
+		if err := emit.Err(); err != nil {
+			logger.Warn("event stream ended early", "route", name, "thread", threadID, "run", runID, "error", err)
+		}
+	})
+}
+
+// approvalMode reads the per-request approval toggle for /human_in_the_loop from
+// the X-AG-Approval header, falling back to the ?approval= query param. The demo
+// always sends forwardedProps:{}, so a header/query channel needs no demo-side
+// send change. Empty (the default) keeps the approval gate on.
+func approvalMode(c fiber.Ctx) string {
+	if v := c.Get("X-AG-Approval"); v != "" {
+		return v
+	}
+	return c.Query("approval")
 }
 
 func agenticHandler(shutdownCtx context.Context, deps *agent.Deps, logger *slog.Logger) fiber.Handler {
