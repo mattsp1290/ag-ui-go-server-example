@@ -1,13 +1,7 @@
 package agent
 
 import (
-	"encoding/json"
-	"fmt"
 	"strings"
-
-	aguitypes "github.com/ag-ui-protocol/ag-ui/sdks/community/go/pkg/core/types"
-	"github.com/cloudwego/eino/schema"
-	"github.com/eino-contrib/jsonschema"
 )
 
 // ToolPolicy selects how a route treats tools.
@@ -96,71 +90,3 @@ const humanInTheLoopSystemPrompt = "You are a careful assistant. Before performi
 	"what you intend to do, and wait for the result. Proceed only after the user approves; if " +
 	"the user rejects, acknowledge it and do not perform the action. For non-consequential " +
 	"requests, answer directly."
-
-// clientToolInfos converts AG-UI client tool definitions (RunAgentInput.tools)
-// into eino ToolInfos the model can be bound to. Errors (empty/duplicate names,
-// unparseable parameter schemas) are surfaced as RUN_ERROR by the caller.
-func clientToolInfos(tools []aguitypes.Tool) ([]*schema.ToolInfo, error) {
-	out := make([]*schema.ToolInfo, 0, len(tools))
-	seen := make(map[string]bool, len(tools))
-	for _, t := range tools {
-		if t.Name == "" {
-			return nil, fmt.Errorf("a client tool has an empty name")
-		}
-		if seen[t.Name] {
-			return nil, fmt.Errorf("duplicate client tool name %q", t.Name)
-		}
-		seen[t.Name] = true
-
-		info := &schema.ToolInfo{Name: t.Name, Desc: t.Description}
-		js, err := toJSONSchema(t.Parameters)
-		if err != nil {
-			return nil, fmt.Errorf("tool %q parameters: %w", t.Name, err)
-		}
-		if js != nil {
-			info.ParamsOneOf = schema.NewParamsOneOfByJSONSchema(js)
-		}
-		out = append(out, info)
-	}
-	return out, nil
-}
-
-// toJSONSchema converts an arbitrary client-supplied JSON Schema (the tool's
-// `parameters`, decoded as `any`) into an eino *jsonschema.Schema. A nil/absent
-// schema yields nil (a no-argument tool).
-func toJSONSchema(params any) (*jsonschema.Schema, error) {
-	if params == nil {
-		return nil, nil
-	}
-	b, err := json.Marshal(params)
-	if err != nil {
-		return nil, err
-	}
-	if string(b) == "null" {
-		return nil, nil
-	}
-	var s jsonschema.Schema
-	if err := json.Unmarshal(b, &s); err != nil {
-		return nil, fmt.Errorf("not a valid JSON Schema: %w", err)
-	}
-	return &s, nil
-}
-
-// classifyToolCalls splits actionable calls into client-defined (handed back to
-// the client) and everything else (the server path). A name in clientNames is a
-// client tool; any other name — a server-owned tool like file_read, or a
-// hallucinated unknown name — goes to the server path, where settlePendingToolCalls
-// runs it (or answers an unknown name with an "unknown tool" error the model can
-// recover from). The server toolset isn't consulted here: known-server and unknown
-// names are handled identically downstream, so distinguishing them would be a
-// no-op.
-func classifyToolCalls(calls []schema.ToolCall, clientNames map[string]bool) (server, client []schema.ToolCall) {
-	for _, tc := range calls {
-		if clientNames[tc.Function.Name] {
-			client = append(client, tc)
-		} else {
-			server = append(server, tc)
-		}
-	}
-	return server, client
-}

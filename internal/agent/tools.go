@@ -13,9 +13,7 @@ import (
 //
 // NO-FILE-WRITE POLICY: this agent must never modify the filesystem. Only the
 // read-only fileops.ReadTool ("file_read") is registered. Do NOT add
-// fileops.NewWriteTool / NewEditTool, the shell tool, or trackerwrite here — the
-// whole point of this server is a read-only agent. The eino-tools workspace root
-// further sandboxes reads to a single directory.
+// fileops.NewWriteTool / NewEditTool, the shell tool, or trackerwrite here.
 type Toolset struct {
 	infos  []*schema.ToolInfo
 	byName map[string]tool.InvokableTool

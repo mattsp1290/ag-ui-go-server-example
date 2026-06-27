@@ -15,12 +15,13 @@ replace github.com/mattsp1290/codex-auth-go => /Users/punk1290/git/codex-auth-go
 replace github.com/mattsp1290/eino-tools => /Users/punk1290/git/eino-tools
 
 require (
-	github.com/ag-ui-protocol/ag-ui/sdks/community/go v0.0.0-00010101000000-000000000000
+	github.com/ag-ui-protocol/ag-ui/sdks/community/go v0.0.0-20260624151131-d2049debabd9
 	github.com/cloudwego/eino v0.9.2
 	github.com/cloudwego/eino-ext/components/model/openai v0.1.13
 	github.com/eino-contrib/jsonschema v1.0.3
 	github.com/evanphx/json-patch v0.5.2
 	github.com/gofiber/fiber/v3 v3.3.0
+	github.com/mattsp1290/eino-agui v0.1.1
 	github.com/mattsp1290/eino-providers v0.0.0-00010101000000-000000000000
 	github.com/mattsp1290/eino-tools v0.0.0-00010101000000-000000000000
 )

@@ -2,8 +2,10 @@ package agent
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"errors"
+	"strings"
 	"testing"
 
 	"github.com/ag-ui-protocol/ag-ui/sdks/community/go/pkg/core/events"
@@ -16,11 +18,12 @@ type failWriter struct{}
 
 func (failWriter) Write([]byte) (int, error) { return 0, errors.New("socket gone") }
 
-// TestScrubEncryptedValues verifies that scrubEncryptedValues zeroes cipher
-// fields on messages that carry them while leaving other fields intact, and
-// returns the original slice unchanged (no allocation) when there is nothing to scrub.
-func TestScrubEncryptedValues(t *testing.T) {
-	plain := types.Message{ID: "1", Role: types.RoleUser, Content: "hello"}
+// TestMessagesSnapshotScrubsEncryptedValues verifies that encrypted reasoning
+// blobs do not appear in client-facing snapshots.
+func TestMessagesSnapshotScrubsEncryptedValues(t *testing.T) {
+	var buf bytes.Buffer
+	w := bufio.NewWriter(&buf)
+	em := NewEmitter(context.Background(), w, sse.NewSSEWriter(), "t1", "r1", nil)
 	withCipher := types.Message{
 		ID:               "2",
 		Role:             types.RoleAssistant,
@@ -29,27 +32,16 @@ func TestScrubEncryptedValues(t *testing.T) {
 		EncryptedContent: "secret-ec",
 	}
 
-	// No cipher → original slice returned (pointer equality).
-	noCipher := []types.Message{plain}
-	if got := scrubEncryptedValues(noCipher); &got[0] != &noCipher[0] {
-		t.Error("expected original slice back when no scrubbing needed")
+	em.MessagesSnapshot([]types.Message{{ID: "1", Role: types.RoleUser, Content: "hello"}, withCipher})
+	if err := w.Flush(); err != nil {
+		t.Fatalf("flush: %v", err)
 	}
-
-	// Cipher present → new slice with fields zeroed, other fields preserved.
-	msgs := []types.Message{plain, withCipher}
-	got := scrubEncryptedValues(msgs)
-	if got[1].EncryptedValue != "" {
-		t.Errorf("EncryptedValue not scrubbed: %q", got[1].EncryptedValue)
+	out := buf.String()
+	if strings.Contains(out, "secret-ev") || strings.Contains(out, "secret-ec") {
+		t.Fatalf("snapshot leaked encrypted content:\n%s", out)
 	}
-	if got[1].EncryptedContent != "" {
-		t.Errorf("EncryptedContent not scrubbed: %q", got[1].EncryptedContent)
-	}
-	if got[1].Content != withCipher.Content {
-		t.Errorf("Content modified unexpectedly: %q", got[1].Content)
-	}
-	// Original slice must be unmodified (copy, not in-place).
-	if msgs[1].EncryptedValue != "secret-ev" {
-		t.Error("original slice was mutated")
+	if !strings.Contains(out, "thinking…") {
+		t.Fatalf("snapshot lost ordinary content:\n%s", out)
 	}
 }
 
@@ -80,23 +72,20 @@ type nopWriter struct{}
 
 func (*nopWriter) Write(p []byte) (int, error) { return len(p), nil }
 
-// TestIsTransportErrorMatchesSDKWrappers pins the SDK's write/flush error wrapper
-// strings that isTransportError matches. Disconnect detection (and the run
-// cancellation it drives) depends on those exact substrings; if a future SDK bump
-// rewords them, this fails loudly instead of silently reclassifying a client
-// disconnect as an encoding error — which would leave a gone-client run generating
-// (and billing) tokens until it finishes on its own.
+// TestIsTransportErrorMatchesSDKWrappers verifies that the shared emitter treats
+// SDK write/flush failures as transport errors and cancels the run context.
 func TestIsTransportErrorMatchesSDKWrappers(t *testing.T) {
 	sw := sse.NewSSEWriter()
 	w := bufio.NewWriter(failWriter{})
 
-	// A valid event encodes fine; the failure happens at the socket write/flush.
-	err := sw.WriteEvent(context.Background(), w, events.NewRunStartedEvent("t", "r"))
-	if err == nil {
-		t.Fatal("expected a write/flush error from the failing writer")
+	ctx, cancel := context.WithCancel(context.Background())
+	em := NewEmitter(ctx, w, sw, "t", "r", cancel)
+
+	em.RunStarted()
+	if em.Err() == nil {
+		t.Fatal("expected emitter transport error from the failing writer")
 	}
-	if !isTransportError(err) {
-		t.Fatalf("isTransportError must classify an SDK write/flush failure as a transport error; "+
-			"the SDK wrapper strings may have changed: %v", err)
+	if ctx.Err() == nil {
+		t.Fatal("expected emitter to cancel the run context after transport failure")
 	}
 }
